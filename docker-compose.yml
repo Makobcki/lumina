@@ -33,8 +33,10 @@ services:
              uvicorn app:app --host 0.0.0.0 --port 8000"
     environment:
       LUMINA_INFERENCE_URL: "http://inference:8001"
+      LUMINA_QDRANT_URL: "http://qdrant:6333"
     depends_on:
       - inference
+      - qdrant
     volumes:
       - ./services/gateway:/app
     ports:

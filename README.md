@@ -18,6 +18,8 @@ Then check:
 - Gateway: `http://localhost:8000/health`
 - Inference: `http://localhost:8001/health`
 - Qdrant: `http://localhost:6333/dashboard`
+- Indexing: `POST http://localhost:8000/index`
+- Search: `POST http://localhost:8000/search`
 
 ## Current status
 This repository now contains the **distributed architecture scaffold**, but not yet:
