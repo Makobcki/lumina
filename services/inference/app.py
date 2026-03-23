@@ -1,18 +1,21 @@
 from __future__ import annotations
 
-import hashlib
-import math
+import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
 
 VECTOR_SIZE = int(os.getenv("LUMINA_VECTOR_SIZE", "1024"))
 MODEL_NAME = os.getenv("LUMINA_EMBED_MODEL", "BAAI/bge-m3")
 RERANKER_NAME = os.getenv("LUMINA_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+MODEL_DEVICE = os.getenv("LUMINA_EMBED_DEVICE", "cpu")
 
-app = FastAPI(title="lumina-inference", version="0.1.0")
+logger = logging.getLogger("lumina.inference")
+logging.basicConfig(level=os.getenv("LUMINA_LOG_LEVEL", "INFO"))
 
 
 class EmbedRequest(BaseModel):
@@ -54,34 +57,60 @@ class HealthResponse(BaseModel):
     model: str
     reranker: str
     vector_size: int
+    device: str
 
 
-def _hash_to_unit_vector(text: str, size: int) -> list[float]:
-    values: list[float] = []
-    counter = 0
-    while len(values) < size:
-        digest = hashlib.blake2b(f"{text}:{counter}".encode("utf-8"), digest_size=32).digest()
-        for idx in range(0, len(digest), 4):
-            chunk = digest[idx : idx + 4]
-            integer = int.from_bytes(chunk, byteorder="little", signed=False)
-            values.append((integer / 2**32) * 2.0 - 1.0)
-            if len(values) == size:
-                break
-        counter += 1
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Loading embedding model '%s' on device '%s'", MODEL_NAME, MODEL_DEVICE)
+    model = SentenceTransformer(MODEL_NAME, device=MODEL_DEVICE)
+    embedding_dimension = model.get_sentence_embedding_dimension()
+    if embedding_dimension is None:
+        raise RuntimeError(f"Unable to determine embedding dimension for model '{MODEL_NAME}'")
 
-    norm = math.sqrt(sum(value * value for value in values)) or 1.0
-    return [value / norm for value in values]
+    app.state.model = model
+    app.state.vector_size = int(embedding_dimension)
+    logger.info("Embedding model '%s' loaded with vector size %s", MODEL_NAME, embedding_dimension)
+    yield
+
+
+app = FastAPI(title="lumina-inference", version="0.2.0", lifespan=lifespan)
+
+
+def _get_model(request: Request) -> SentenceTransformer:
+    model = getattr(request.app.state, "model", None)
+    if model is None:
+        raise HTTPException(status_code=503, detail="Embedding model is not loaded")
+    return model
 
 
 @app.get("/health", response_model=HealthResponse)
-def health() -> HealthResponse:
-    return HealthResponse(status="ok", model=MODEL_NAME, reranker=RERANKER_NAME, vector_size=VECTOR_SIZE)
+def health(request: Request) -> HealthResponse:
+    vector_size = int(getattr(request.app.state, "vector_size", VECTOR_SIZE))
+    return HealthResponse(
+        status="ok",
+        model=MODEL_NAME,
+        reranker=RERANKER_NAME,
+        vector_size=vector_size,
+        device=MODEL_DEVICE,
+    )
 
 
 @app.post("/embed", response_model=EmbedResponse)
-def embed(request: EmbedRequest) -> EmbedResponse:
-    embeddings = [_hash_to_unit_vector(text, VECTOR_SIZE) for text in request.texts]
-    return EmbedResponse(model=MODEL_NAME, vector_size=VECTOR_SIZE, embeddings=embeddings)
+def embed(request: Request, payload: EmbedRequest) -> EmbedResponse:
+    model = _get_model(request)
+    embeddings = model.encode(
+        payload.texts,
+        normalize_embeddings=payload.normalize,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    vector_size = int(getattr(request.app.state, "vector_size", VECTOR_SIZE))
+    return EmbedResponse(
+        model=MODEL_NAME,
+        vector_size=vector_size,
+        embeddings=embeddings.tolist(),
+    )
 
 
 @app.post("/rerank", response_model=RerankResponse)

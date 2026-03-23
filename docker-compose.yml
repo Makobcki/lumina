@@ -14,7 +14,7 @@ services:
     image: python:3.12-slim
     working_dir: /app
     command: >-
-      sh -c "pip install --no-cache-dir -r requirements.txt &&
+      sh -c "pip install --no-cache-dir . &&
              uvicorn app:app --host 0.0.0.0 --port 8001"
     environment:
       LUMINA_VECTOR_SIZE: "1024"
