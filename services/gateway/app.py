@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
@@ -87,6 +88,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="lumina-gateway", version="0.2.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _get_http_client(request: Request) -> httpx.AsyncClient:
