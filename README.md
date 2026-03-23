@@ -8,6 +8,7 @@ Distributed search engine baseline for Wikipedia and IT documentation.
 - `services/inference` — FastAPI inference service with SentenceTransformer-based embeddings and reranker scaffold.
 - `services/gateway` — FastAPI gateway scaffold.
 - `docker-compose.yml` — local development topology for Qdrant + inference + gateway.
+- `services/crawler` — CLI crawler for fetching, cleaning, chunking, and indexing web pages through the gateway.
 
 ## Quick start
 ```bash
@@ -21,8 +22,18 @@ Then check:
 - Indexing: `POST http://localhost:8000/index`
 - Search: `POST http://localhost:8000/search`
 
+## Crawler
+Install crawler dependencies and run locally:
+```bash
+cd services/crawler
+pip install -r requirements.txt
+python main.py
+```
+
+The crawler fetches a small set of seed URLs, removes noisy HTML, chunks text, and pushes each chunk to `POST /index` on the gateway.
+
 ## Current status
 This repository now contains the **distributed architecture scaffold**, but not yet:
-- production crawler implementation,
-- live Qdrant collection provisioning,
+- production-grade frontier management / politeness controls for crawling,
+- dump-based Wikipedia ingestion,
 - React frontend.
