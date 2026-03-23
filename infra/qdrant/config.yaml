@@ -1,0 +1,11 @@
+storage:
+  indexing_threshold: 20000
+
+optimizers:
+  default_segment_number: 2
+
+quantization_config:
+  scalar:
+    type: int8
+    quantile: 0.99
+    always_ram: true
