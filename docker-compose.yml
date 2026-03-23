@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./infra/qdrant/config.yaml:/qdrant/config/production.yaml:ro
+      - qdrant_storage:/qdrant/storage
+
+  inference:
+    image: python:3.12-slim
+    working_dir: /app
+    command: >-
+      sh -c "pip install --no-cache-dir . &&
+             uvicorn app:app --host 0.0.0.0 --port 8001"
+    environment:
+      LUMINA_VECTOR_SIZE: "1024"
+      LUMINA_EMBED_MODEL: "BAAI/bge-m3"
+      LUMINA_RERANKER_MODEL: "BAAI/bge-reranker-v2-m3"
+    volumes:
+      - ./services/inference:/app
+    ports:
+      - "8001:8001"
+
+  gateway:
+    image: python:3.12-slim
+    working_dir: /app
+    command: >-
+      sh -c "pip install --no-cache-dir -r requirements.txt &&
+             uvicorn app:app --host 0.0.0.0 --port 8000"
+    environment:
+      LUMINA_INFERENCE_URL: "http://inference:8001"
+    depends_on:
+      - inference
+    volumes:
+      - ./services/gateway:/app
+    ports:
+      - "8000:8000"
+
+volumes:
+  qdrant_storage:
