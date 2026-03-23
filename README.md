@@ -1,2 +1,50 @@
-# lumina
-search engine
+# Lumina
+
+Distributed search engine baseline for Wikipedia and IT documentation.
+
+## Components
+- `docs/architecture.md` — architecture baseline, latency considerations, schema, and rollout notes.
+- `infra/qdrant/config.yaml` — Qdrant memory-oriented baseline with scalar quantization.
+- `services/inference` — FastAPI inference service with SentenceTransformer-based embeddings and reranker scaffold.
+- `services/gateway` — FastAPI gateway scaffold.
+- `docker-compose.yml` — local development topology for Qdrant + inference + gateway.
+- `services/crawler` — CLI crawler for fetching, cleaning, chunking, and indexing web pages through the gateway.
+- `frontend` — React + Vite + Tailwind SPA for search queries and result rendering.
+
+## Quick start
+```bash
+docker compose up --build
+```
+
+Then check:
+- Gateway: `http://localhost:8000/health`
+- Inference: `http://localhost:8001/health`
+- Qdrant: `http://localhost:6333/dashboard`
+- Indexing: `POST http://localhost:8000/index`
+- Search: `POST http://localhost:8000/search`
+
+## Crawler
+Install crawler dependencies and run locally:
+```bash
+cd services/crawler
+pip install -r requirements.txt
+python main.py
+```
+
+The crawler fetches a small set of seed URLs, removes noisy HTML, chunks text, and pushes each chunk to `POST /index` on the gateway.
+
+## Frontend
+Run the SPA locally after installing dependencies:
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend talks directly to the gateway search API at `http://localhost:8000/search`.
+
+## Current status
+This repository now contains the **distributed architecture scaffold**, but not yet:
+- production-grade frontier management / politeness controls for crawling,
+- dump-based Wikipedia ingestion,
+- production deployment hardening for the frontend.
