@@ -17,6 +17,8 @@ INFERENCE_URL = os.getenv("LUMINA_INFERENCE_URL", "http://inference:8001")
 QDRANT_URL = os.getenv("LUMINA_QDRANT_URL", "http://qdrant:6333")
 COLLECTION_NAME = os.getenv("LUMINA_QDRANT_COLLECTION", "documents")
 VECTOR_SIZE = int(os.getenv("LUMINA_VECTOR_SIZE", "1024"))
+RERANK_CANDIDATE_MULTIPLIER = int(os.getenv("LUMINA_RERANK_CANDIDATE_MULTIPLIER", "3"))
+MAX_RERANK_CANDIDATES = int(os.getenv("LUMINA_MAX_RERANK_CANDIDATES", "30"))
 
 logger = logging.getLogger("lumina.gateway")
 logging.basicConfig(level=os.getenv("LUMINA_LOG_LEVEL", "INFO"))
@@ -87,7 +89,7 @@ async def lifespan(app: FastAPI):
     await qdrant.close()
 
 
-app = FastAPI(title="lumina-gateway", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="lumina-gateway", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -111,15 +113,18 @@ def _get_qdrant(request: Request) -> AsyncQdrantClient:
     return client
 
 
-async def _embed_texts(request: Request, texts: list[str]) -> tuple[str, list[list[float]]]:
+async def _post_inference(request: Request, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
     client = _get_http_client(request)
     try:
-        response = await client.post(f"{INFERENCE_URL}/embed", json={"texts": texts})
+        response = await client.post(f"{INFERENCE_URL}{endpoint}", json=payload)
         response.raise_for_status()
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Inference service unavailable: {exc}") from exc
+    return response.json()
 
-    payload: dict[str, Any] = response.json()
+
+async def _embed_texts(request: Request, texts: list[str]) -> tuple[str, list[list[float]]]:
+    payload = await _post_inference(request, "/embed", {"texts": texts})
     return payload["model"], payload["embeddings"]
 
 
@@ -162,22 +167,54 @@ async def index_document(request: Request, payload: IndexRequest) -> IndexRespon
 async def search(request: Request, payload: SearchRequest) -> SearchResponse:
     embedding_model, embeddings = await _embed_texts(request, [payload.query])
     qdrant = _get_qdrant(request)
+    candidate_limit = min(max(payload.top_k * RERANK_CANDIDATE_MULTIPLIER, payload.top_k), MAX_RERANK_CANDIDATES)
     query_response = await qdrant.query_points(
         collection_name=COLLECTION_NAME,
         query=embeddings[0],
-        limit=payload.top_k,
+        limit=candidate_limit,
         with_payload=True,
     )
 
+    candidates_by_id: dict[str, dict[str, Any]] = {}
+    rerank_documents: list[dict[str, str | None]] = []
+    for hit in query_response.points:
+        payload_data = dict(hit.payload or {})
+        candidate_id = str(hit.id)
+        candidates_by_id[candidate_id] = {
+            "title": str(payload_data.get("title", "")),
+            "url": str(payload_data.get("url", "")),
+            "content": str(payload_data.get("content", "")),
+            "source": str(payload_data.get("source", "indexed")),
+            "initial_score": float(hit.score),
+        }
+        rerank_documents.append(
+            {
+                "id": candidate_id,
+                "title": str(payload_data.get("title", "")),
+                "text": str(payload_data.get("content", "")),
+            }
+        )
+
+    if not rerank_documents:
+        return SearchResponse(query=payload.query, embedding_model=embedding_model, results=[])
+
+    rerank_payload = await _post_inference(
+        request,
+        "/rerank",
+        {"query": payload.query, "documents": rerank_documents, "top_k": payload.top_k},
+    )
+    reranked_results = rerank_payload["results"]
+
     results = [
         SearchResult(
-            id=str(hit.id),
-            title=str((hit.payload or {}).get("title", "")),
-            score=float(hit.score),
-            source=str((hit.payload or {}).get("source", "indexed")),
-            url=str((hit.payload or {}).get("url", "")),
-            snippet=str((hit.payload or {}).get("content", ""))[:240],
+            id=result["id"],
+            title=str(candidates_by_id[result["id"]]["title"]),
+            score=float(result["score"]),
+            source=str(candidates_by_id[result["id"]]["source"]),
+            url=str(candidates_by_id[result["id"]]["url"]),
+            snippet=str(candidates_by_id[result["id"]]["content"])[:240],
         )
-        for hit in query_response.points
+        for result in reranked_results
+        if result["id"] in candidates_by_id
     ]
     return SearchResponse(query=payload.query, embedding_model=embedding_model, results=results)
