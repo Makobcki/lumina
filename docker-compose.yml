@@ -10,6 +10,17 @@ services:
       - ./infra/qdrant/config.yaml:/qdrant/config/production.yaml:ro
       - qdrant_storage:/qdrant/storage
 
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: lumina
+      POSTGRES_USER: lumina
+      POSTGRES_PASSWORD: lumina
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   inference:
     image: python:3.12-slim
     working_dir: /app
@@ -34,9 +45,11 @@ services:
     environment:
       LUMINA_INFERENCE_URL: "http://inference:8001"
       LUMINA_QDRANT_URL: "http://qdrant:6333"
+      LUMINA_POSTGRES_DSN: "postgresql://lumina:lumina@postgres:5432/lumina"
     depends_on:
       - inference
       - qdrant
+      - postgres
     volumes:
       - ./services/gateway:/app
     ports:
@@ -44,3 +57,4 @@ services:
 
 volumes:
   qdrant_storage:
+  postgres_data:
