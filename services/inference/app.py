@@ -370,7 +370,7 @@ def _build_best_snippets(
     sentence_scores = [float(score) for score in reranker.predict(pairs)]
 
     best_by_document: dict[str, SnippetResult] = {
-        document.id: SnippetResult(id=document.id, snippet="", score=0.0)
+        document.id: SnippetResult(id=document.id, snippet="", score=-float("inf"))
         for document in documents
     }
     for (document_id, sentence), score in zip(sentence_candidates, sentence_scores, strict=True):
