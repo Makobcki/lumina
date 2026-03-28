@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
+from qdrant_client import models
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 INFERENCE_URL = os.getenv("LUMINA_INFERENCE_URL", "http://inference:8001")
@@ -24,6 +25,8 @@ COLLECTION_NAME = os.getenv("LUMINA_QDRANT_COLLECTION", "documents")
 VECTOR_SIZE = int(os.getenv("LUMINA_VECTOR_SIZE", "1024"))
 RERANK_CANDIDATE_MULTIPLIER = int(os.getenv("LUMINA_RERANK_CANDIDATE_MULTIPLIER", "3"))
 MAX_RERANK_CANDIDATES = int(os.getenv("LUMINA_MAX_RERANK_CANDIDATES", "30"))
+DENSE_VECTOR_NAME = os.getenv("LUMINA_QDRANT_DENSE_VECTOR_NAME", "dense")
+SPARSE_VECTOR_NAME = os.getenv("LUMINA_QDRANT_SPARSE_VECTOR_NAME", "sparse")
 
 logger = logging.getLogger("lumina.gateway")
 logging.basicConfig(level=os.getenv("LUMINA_LOG_LEVEL", "INFO"))
@@ -96,9 +99,22 @@ async def lifespan(app: FastAPI):
     if not collection_exists:
         await qdrant.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+            vectors_config={
+                DENSE_VECTOR_NAME: VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+            },
+            sparse_vectors_config={
+                SPARSE_VECTOR_NAME: models.SparseVectorParams(
+                    index=models.SparseIndexParams(on_disk=False),
+                )
+            },
         )
-        logger.info("Created Qdrant collection '%s' with vector size %s", COLLECTION_NAME, VECTOR_SIZE)
+        logger.info(
+            "Created Qdrant collection '%s' with dense='%s' (size=%s) and sparse='%s'",
+            COLLECTION_NAME,
+            DENSE_VECTOR_NAME,
+            VECTOR_SIZE,
+            SPARSE_VECTOR_NAME,
+        )
     else:
         logger.info("Qdrant collection '%s' already exists", COLLECTION_NAME)
 
@@ -188,6 +204,15 @@ async def _embed_texts(request: Request, texts: list[str]) -> tuple[str, list[li
     return payload["model"], payload["embeddings"]
 
 
+async def _sparse_embed_texts(request: Request, texts: list[str]) -> tuple[str, list[models.SparseVector]]:
+    payload = await _post_inference(request, "/embed/sparse", {"texts": texts})
+    sparse_vectors = [
+        models.SparseVector(indices=embedding["indices"], values=embedding["values"])
+        for embedding in payload["embeddings"]
+    ]
+    return payload["model"], sparse_vectors
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(
@@ -202,13 +227,17 @@ async def health() -> HealthResponse:
 @app.post("/index", response_model=IndexResponse)
 async def index_document(request: Request, payload: IndexRequest) -> IndexResponse:
     embedding_model, embeddings = await _embed_texts(request, [payload.content])
+    _, sparse_embeddings = await _sparse_embed_texts(request, [payload.content])
     document_id = payload.id or str(uuid4())
 
     await _store_raw_document(request, document_id=document_id, content=payload.content)
 
     point = PointStruct(
         id=document_id,
-        vector=embeddings[0],
+        vector={
+            DENSE_VECTOR_NAME: embeddings[0],
+            SPARSE_VECTOR_NAME: sparse_embeddings[0],
+        },
         payload={
             "title": payload.title,
             "url": payload.url,
@@ -230,11 +259,24 @@ async def index_document(request: Request, payload: IndexRequest) -> IndexRespon
 @app.post("/search", response_model=SearchResponse)
 async def search(request: Request, payload: SearchRequest) -> SearchResponse:
     embedding_model, embeddings = await _embed_texts(request, [payload.query])
+    _, sparse_embeddings = await _sparse_embed_texts(request, [payload.query])
     qdrant = _get_qdrant(request)
     candidate_limit = min(max(payload.top_k * RERANK_CANDIDATE_MULTIPLIER, payload.top_k), MAX_RERANK_CANDIDATES)
     query_response = await qdrant.query_points(
         collection_name=COLLECTION_NAME,
-        query=embeddings[0],
+        prefetch=[
+            models.Prefetch(
+                query=embeddings[0],
+                using=DENSE_VECTOR_NAME,
+                limit=candidate_limit,
+            ),
+            models.Prefetch(
+                query=sparse_embeddings[0],
+                using=SPARSE_VECTOR_NAME,
+                limit=candidate_limit,
+            ),
+        ],
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=candidate_limit,
         with_payload=True,
     )

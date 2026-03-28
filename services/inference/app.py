@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Literal
@@ -19,6 +20,8 @@ EMBED_MAX_BATCH_SIZE = int(os.getenv("LUMINA_EMBED_MAX_BATCH_SIZE", "32"))
 EMBED_BATCH_TIMEOUT_MS = int(os.getenv("LUMINA_EMBED_BATCH_TIMEOUT_MS", "50"))
 EMBED_CONCURRENCY_LIMIT = int(os.getenv("LUMINA_EMBED_CONCURRENCY", "1"))
 RERANK_CONCURRENCY_LIMIT = int(os.getenv("LUMINA_RERANK_CONCURRENCY", "1"))
+SPARSE_VOCAB_SIZE = int(os.getenv("LUMINA_SPARSE_VOCAB_SIZE", "200000"))
+SPARSE_MIN_TOKEN_LEN = int(os.getenv("LUMINA_SPARSE_MIN_TOKEN_LEN", "2"))
 
 logger = logging.getLogger("lumina.inference")
 logging.basicConfig(level=os.getenv("LUMINA_LOG_LEVEL", "INFO"))
@@ -58,6 +61,21 @@ class RerankResponse(BaseModel):
     results: list[RerankResult]
 
 
+class SparseEmbedRequest(BaseModel):
+    texts: list[str] = Field(min_length=1, max_length=128)
+
+
+class SparseVectorPayload(BaseModel):
+    indices: list[int]
+    values: list[float]
+
+
+class SparseEmbedResponse(BaseModel):
+    model: str
+    vocab_size: int
+    embeddings: list[SparseVectorPayload]
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"]
     model: str
@@ -69,6 +87,7 @@ class HealthResponse(BaseModel):
     embed_batch_timeout_ms: int
     embed_concurrency_limit: int
     rerank_concurrency_limit: int
+    sparse_vocab_size: int
 
 
 @dataclass(slots=True)
@@ -217,6 +236,7 @@ def health(request: Request) -> HealthResponse:
         embed_batch_timeout_ms=EMBED_BATCH_TIMEOUT_MS,
         embed_concurrency_limit=EMBED_CONCURRENCY_LIMIT,
         rerank_concurrency_limit=RERANK_CONCURRENCY_LIMIT,
+        sparse_vocab_size=SPARSE_VOCAB_SIZE,
     )
 
 
@@ -236,8 +256,47 @@ async def embed(request: Request, payload: EmbedRequest) -> EmbedResponse:
     )
 
 
+@app.post("/embed/sparse", response_model=SparseEmbedResponse)
+async def sparse_embed(payload: SparseEmbedRequest) -> SparseEmbedResponse:
+    embeddings = await asyncio.to_thread(lambda: [_sparse_encode(text) for text in payload.texts])
+    return SparseEmbedResponse(
+        model=f"bm25-hash-{SPARSE_VOCAB_SIZE}",
+        vocab_size=SPARSE_VOCAB_SIZE,
+        embeddings=embeddings,
+    )
+
+
 def _predict_rerank_scores(reranker: CrossEncoder, pairs: list[list[str]]) -> list[float]:
     return [float(score) for score in reranker.predict(pairs)]
+
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
+
+
+def _stable_sparse_index(token: str) -> int:
+    value = 2166136261
+    for byte in token.encode("utf-8"):
+        value ^= byte
+        value = (value * 16777619) & 0xFFFFFFFF
+    return value % SPARSE_VOCAB_SIZE
+
+
+def _sparse_encode(text: str) -> SparseVectorPayload:
+    term_weights: dict[int, float] = {}
+    for raw in TOKEN_RE.findall(text):
+        token = raw.lower()
+        if len(token) < SPARSE_MIN_TOKEN_LEN:
+            continue
+        sparse_index = _stable_sparse_index(token)
+        term_weights[sparse_index] = term_weights.get(sparse_index, 0.0) + 1.0
+
+    if not term_weights:
+        return SparseVectorPayload(indices=[], values=[])
+
+    sorted_weights = sorted(term_weights.items(), key=lambda item: item[0])
+    indices = [index for index, _ in sorted_weights]
+    values = [float(1.0 + (count / (count + 1.0))) for _, count in sorted_weights]
+    return SparseVectorPayload(indices=indices, values=values)
 
 
 @app.post("/rerank", response_model=RerankResponse)
