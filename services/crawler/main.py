@@ -21,6 +21,7 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 load_dotenv()
 
 GATEWAY_BULK_INDEX_URL = os.getenv("LUMINA_GATEWAY_BULK_INDEX_URL", "http://localhost:8000/index/bulk")
+GATEWAY_DELETE_URL = os.getenv("LUMINA_GATEWAY_DELETE_URL", "http://localhost:8000/documents")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("LUMINA_REQUEST_TIMEOUT_SECONDS", "30.0"))
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
@@ -236,6 +237,21 @@ async def _publish_to_redis_stream(
     )
 
 
+async def _delete_existing_document(url: str, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> None:
+    async with semaphore:
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+            retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+            reraise=True,
+        ):
+            with attempt:
+                response = await client.delete(GATEWAY_DELETE_URL, params={"url": url})
+                response.raise_for_status()
+
+    logger.info("document_cleanup_completed", url=url)
+
+
 async def index_chunks(
     url: str,
     title: str,
@@ -306,6 +322,7 @@ async def crawl_and_index(
     title, text = result
     chunks = chunk_text(text)
     logger.info("chunks_prepared", chunk_count=len(chunks), url=url)
+    await _delete_existing_document(url=url, client=gateway_client, semaphore=indexing_semaphore)
     await index_chunks(
         url=url,
         title=title,
