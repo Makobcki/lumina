@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 from uuid import uuid4
 
+import asyncpg
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +16,10 @@ from qdrant_client.models import Distance, PointStruct, VectorParams
 
 INFERENCE_URL = os.getenv("LUMINA_INFERENCE_URL", "http://inference:8001")
 QDRANT_URL = os.getenv("LUMINA_QDRANT_URL", "http://qdrant:6333")
+POSTGRES_DSN = os.getenv(
+    "LUMINA_POSTGRES_DSN",
+    "postgresql://lumina:lumina@postgres:5432/lumina",
+)
 COLLECTION_NAME = os.getenv("LUMINA_QDRANT_COLLECTION", "documents")
 VECTOR_SIZE = int(os.getenv("LUMINA_VECTOR_SIZE", "1024"))
 RERANK_CANDIDATE_MULTIPLIER = int(os.getenv("LUMINA_RERANK_CANDIDATE_MULTIPLIER", "3"))
@@ -63,15 +68,29 @@ class HealthResponse(BaseModel):
     inference_url: str
     qdrant_url: str
     collection: str
+    raw_storage: str
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     http_client = httpx.AsyncClient(timeout=30.0)
     qdrant = AsyncQdrantClient(url=QDRANT_URL)
+    pg_pool = await asyncpg.create_pool(dsn=POSTGRES_DSN, min_size=1, max_size=10)
 
     app.state.http_client = http_client
     app.state.qdrant = qdrant
+    app.state.pg_pool = pg_pool
+
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_documents (
+                document_id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
 
     collection_exists = await qdrant.collection_exists(collection_name=COLLECTION_NAME)
     if not collection_exists:
@@ -87,9 +106,10 @@ async def lifespan(app: FastAPI):
 
     await http_client.aclose()
     await qdrant.close()
+    await pg_pool.close()
 
 
-app = FastAPI(title="lumina-gateway", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="lumina-gateway", version="0.4.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -111,6 +131,46 @@ def _get_qdrant(request: Request) -> AsyncQdrantClient:
     if client is None:
         raise HTTPException(status_code=503, detail="Qdrant client is not initialized")
     return client
+
+
+def _get_pg_pool(request: Request) -> asyncpg.Pool:
+    pool = getattr(request.app.state, "pg_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=503, detail="PostgreSQL pool is not initialized")
+    return pool
+
+
+async def _store_raw_document(request: Request, document_id: str, content: str) -> None:
+    pool = _get_pg_pool(request)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO raw_documents (document_id, content)
+            VALUES ($1, $2)
+            ON CONFLICT (document_id)
+            DO UPDATE SET content = EXCLUDED.content
+            """,
+            document_id,
+            content,
+        )
+
+
+async def _fetch_raw_documents(request: Request, document_ids: list[str]) -> dict[str, str]:
+    if not document_ids:
+        return {}
+
+    pool = _get_pg_pool(request)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT document_id, content
+            FROM raw_documents
+            WHERE document_id = ANY($1::text[])
+            """,
+            document_ids,
+        )
+
+    return {str(row["document_id"]): str(row["content"]) for row in rows}
 
 
 async def _post_inference(request: Request, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -135,6 +195,7 @@ async def health() -> HealthResponse:
         inference_url=INFERENCE_URL,
         qdrant_url=QDRANT_URL,
         collection=COLLECTION_NAME,
+        raw_storage="postgresql",
     )
 
 
@@ -142,13 +203,16 @@ async def health() -> HealthResponse:
 async def index_document(request: Request, payload: IndexRequest) -> IndexResponse:
     embedding_model, embeddings = await _embed_texts(request, [payload.content])
     document_id = payload.id or str(uuid4())
+
+    await _store_raw_document(request, document_id=document_id, content=payload.content)
+
     point = PointStruct(
         id=document_id,
         vector=embeddings[0],
         payload={
             "title": payload.title,
             "url": payload.url,
-            "content": payload.content,
+            "document_id": document_id,
             "source": "indexed",
         },
     )
@@ -176,22 +240,33 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
     )
 
     candidates_by_id: dict[str, dict[str, Any]] = {}
-    rerank_documents: list[dict[str, str | None]] = []
+    candidate_ids: list[str] = []
     for hit in query_response.points:
         payload_data = dict(hit.payload or {})
-        candidate_id = str(hit.id)
+        candidate_id = str(payload_data.get("document_id") or hit.id)
+        candidate_ids.append(candidate_id)
         candidates_by_id[candidate_id] = {
             "title": str(payload_data.get("title", "")),
             "url": str(payload_data.get("url", "")),
-            "content": str(payload_data.get("content", "")),
             "source": str(payload_data.get("source", "indexed")),
             "initial_score": float(hit.score),
         }
+
+    if not candidate_ids:
+        return SearchResponse(query=payload.query, embedding_model=embedding_model, results=[])
+
+    raw_documents = await _fetch_raw_documents(request, candidate_ids)
+
+    rerank_documents: list[dict[str, str | None]] = []
+    for candidate_id in candidate_ids:
+        text = raw_documents.get(candidate_id)
+        if not text:
+            continue
         rerank_documents.append(
             {
                 "id": candidate_id,
-                "title": str(payload_data.get("title", "")),
-                "text": str(payload_data.get("content", "")),
+                "title": str(candidates_by_id[candidate_id]["title"]),
+                "text": text,
             }
         )
 
@@ -212,7 +287,7 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
             score=float(result["score"]),
             source=str(candidates_by_id[result["id"]]["source"]),
             url=str(candidates_by_id[result["id"]]["url"]),
-            snippet=str(candidates_by_id[result["id"]]["content"])[:240],
+            snippet=raw_documents.get(result["id"], "")[:240],
         )
         for result in reranked_results
         if result["id"] in candidates_by_id
