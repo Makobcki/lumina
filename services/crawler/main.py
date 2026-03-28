@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -10,6 +11,7 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
+import redis.asyncio as redis
 import structlog
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -27,6 +29,9 @@ MAX_CONCURRENT_FETCHES = 20
 MAX_CONCURRENT_INDEX_REQUESTS = 20
 USER_AGENT = "lumina-crawler/1.0"
 DEFAULT_CRAWL_DELAY_SECONDS = 0.5
+INGESTION_MODE = os.getenv("LUMINA_INGESTION_MODE", "direct")
+REDIS_URL = os.getenv("LUMINA_REDIS_URL", "redis://localhost:6379/0")
+REDIS_STREAM_NAME = os.getenv("LUMINA_REDIS_STREAM_NAME", "lumina:index:bulk")
 START_URLS = [
     "https://fastapi.tiangolo.com/",
     "https://ru.wikipedia.org/wiki/Очередь_(программирование)",
@@ -43,6 +48,7 @@ REMOVABLE_TAGS = {
     "form",
     "aside",
 }
+
 
 def _configure_logging() -> None:
     logging.basicConfig(format="%(message)s", level=os.getenv("LUMINA_LOG_LEVEL", "INFO"), force=True)
@@ -168,12 +174,75 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHU
     return [chunk for chunk in splitter.split_text(text) if chunk]
 
 
+def _build_documents(url: str, title: str, batch_start_index: int, batch_chunks: list[str]) -> list[dict[str, str]]:
+    return [
+        {
+            "title": f"{title} [chunk {chunk_index}]",
+            "url": url,
+            "content": chunk,
+        }
+        for chunk_index, chunk in enumerate(batch_chunks, start=batch_start_index)
+    ]
+
+
+async def _send_to_gateway(
+    url: str,
+    batch_start_index: int,
+    batch_chunks: list[str],
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    title: str,
+) -> None:
+    payload = {"documents": _build_documents(url=url, title=title, batch_start_index=batch_start_index, batch_chunks=batch_chunks)}
+    async with semaphore:
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+            retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+            reraise=True,
+        ):
+            with attempt:
+                response = await client.post(GATEWAY_BULK_INDEX_URL, json=payload)
+                response.raise_for_status()
+
+    logger.info(
+        "chunks_indexed_bulk",
+        url=url,
+        chunk_start=batch_start_index,
+        chunk_end=batch_start_index + len(batch_chunks) - 1,
+        chunk_count=len(batch_chunks),
+    )
+
+
+async def _publish_to_redis_stream(
+    url: str,
+    batch_start_index: int,
+    batch_chunks: list[str],
+    stream_client: redis.Redis,
+    title: str,
+) -> None:
+    payload = {"documents": _build_documents(url=url, title=title, batch_start_index=batch_start_index, batch_chunks=batch_chunks)}
+    await stream_client.xadd(
+        name=REDIS_STREAM_NAME,
+        fields={"payload": json.dumps(payload, ensure_ascii=False)},
+    )
+    logger.info(
+        "chunks_queued_bulk",
+        url=url,
+        stream=REDIS_STREAM_NAME,
+        chunk_start=batch_start_index,
+        chunk_end=batch_start_index + len(batch_chunks) - 1,
+        chunk_count=len(batch_chunks),
+    )
+
+
 async def index_chunks(
     url: str,
     title: str,
     chunks: Iterable[str],
-    client: httpx.AsyncClient,
+    gateway_client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
+    stream_client: redis.Redis | None,
 ) -> None:
     chunk_list = list(chunks)
     if not chunk_list:
@@ -182,41 +251,41 @@ async def index_chunks(
     if INDEX_BULK_SIZE < 1:
         raise ValueError("LUMINA_INDEX_BULK_SIZE must be >= 1")
 
-    async def index_bulk(batch_start_index: int, batch_chunks: list[str]) -> None:
-        documents = [
-            {
-                "title": f"{title} [chunk {chunk_index}]",
-                "url": url,
-                "content": chunk,
-            }
-            for chunk_index, chunk in enumerate(batch_chunks, start=batch_start_index)
-        ]
-        payload = {"documents": documents}
-        async with semaphore:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(5),
-                wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
-                retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
-                reraise=True,
-            ):
-                with attempt:
-                    response = await client.post(GATEWAY_BULK_INDEX_URL, json=payload)
-                    response.raise_for_status()
-            logger.info(
-                "chunks_indexed_bulk",
-                url=url,
-                chunk_start=batch_start_index,
-                chunk_end=batch_start_index + len(batch_chunks) - 1,
-                chunk_count=len(batch_chunks),
+    if INGESTION_MODE not in {"direct", "redis_stream"}:
+        raise ValueError("LUMINA_INGESTION_MODE must be one of: direct, redis_stream")
+
+    tasks: list[asyncio.Task[None]] = []
+    for start_index in range(0, len(chunk_list), INDEX_BULK_SIZE):
+        batch_start_index = start_index + 1
+        batch_chunks = chunk_list[start_index : start_index + INDEX_BULK_SIZE]
+        if INGESTION_MODE == "direct":
+            tasks.append(
+                asyncio.create_task(
+                    _send_to_gateway(
+                        url=url,
+                        batch_start_index=batch_start_index,
+                        batch_chunks=batch_chunks,
+                        client=gateway_client,
+                        semaphore=semaphore,
+                        title=title,
+                    )
+                )
+            )
+        else:
+            if stream_client is None:
+                raise ValueError("Redis stream mode requires an initialized Redis client")
+            tasks.append(
+                asyncio.create_task(
+                    _publish_to_redis_stream(
+                        url=url,
+                        batch_start_index=batch_start_index,
+                        batch_chunks=batch_chunks,
+                        stream_client=stream_client,
+                        title=title,
+                    )
+                )
             )
 
-    tasks = [
-        index_bulk(
-            batch_start_index=start_index + 1,
-            batch_chunks=chunk_list[start_index : start_index + INDEX_BULK_SIZE],
-        )
-        for start_index in range(0, len(chunk_list), INDEX_BULK_SIZE)
-    ]
     if tasks:
         await asyncio.gather(*tasks)
 
@@ -227,6 +296,7 @@ async def crawl_and_index(
     gateway_client: httpx.AsyncClient,
     politeness_policy: PolitenessPolicy,
     indexing_semaphore: asyncio.Semaphore,
+    stream_client: redis.Redis | None,
 ) -> None:
     logger.info("fetching_url", url=url)
     result = await fetch_and_clean(url=url, client=fetch_client, politeness_policy=politeness_policy)
@@ -236,15 +306,31 @@ async def crawl_and_index(
     title, text = result
     chunks = chunk_text(text)
     logger.info("chunks_prepared", chunk_count=len(chunks), url=url)
-    await index_chunks(url=url, title=title, chunks=chunks, client=gateway_client, semaphore=indexing_semaphore)
+    await index_chunks(
+        url=url,
+        title=title,
+        chunks=chunks,
+        gateway_client=gateway_client,
+        semaphore=indexing_semaphore,
+        stream_client=stream_client,
+    )
 
 
 async def run_crawler(urls: list[str]) -> None:
+    if INGESTION_MODE not in {"direct", "redis_stream"}:
+        raise ValueError("LUMINA_INGESTION_MODE must be one of: direct, redis_stream")
+
     limits = httpx.Limits(max_connections=MAX_CONCURRENT_FETCHES, max_keepalive_connections=MAX_CONCURRENT_FETCHES)
     timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
 
     politeness_policy = PolitenessPolicy(delay_seconds=DEFAULT_CRAWL_DELAY_SECONDS)
     indexing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INDEX_REQUESTS)
+
+    redis_client: redis.Redis | None = None
+    if INGESTION_MODE == "redis_stream":
+        redis_client = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+        await redis_client.ping()
+        logger.info("redis_stream_mode_enabled", redis_url=REDIS_URL, stream=REDIS_STREAM_NAME)
 
     async with httpx.AsyncClient(timeout=timeout, limits=limits, headers={"User-Agent": USER_AGENT}) as fetch_client, httpx.AsyncClient(
         timeout=timeout,
@@ -258,10 +344,14 @@ async def run_crawler(urls: list[str]) -> None:
                 gateway_client=gateway_client,
                 politeness_policy=politeness_policy,
                 indexing_semaphore=indexing_semaphore,
+                stream_client=redis_client,
             )
             for url in urls
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    if redis_client is not None:
+        await redis_client.aclose()
 
     for url, result in zip(urls, results, strict=True):
         if isinstance(result, Exception):

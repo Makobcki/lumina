@@ -43,7 +43,44 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The crawler fetches a small set of seed URLs, removes noisy HTML, chunks text, and pushes each chunk to `POST /index` on the gateway (`LUMINA_GATEWAY_INDEX_URL` from `.env`). Gateway calls to `/index` are retried with exponential backoff via `tenacity`.
+The crawler fetches a small set of seed URLs, removes noisy HTML, chunks text, and sends chunk batches to `POST /index/bulk` on the gateway (`LUMINA_GATEWAY_BULK_INDEX_URL`). Requests are retried with exponential backoff via `tenacity`.
+
+Queue-based ingestion is available via Redis Streams:
+```bash
+# producer mode (crawler -> redis stream)
+LUMINA_INGESTION_MODE=redis_stream \
+LUMINA_REDIS_URL=redis://localhost:6379/0 \
+python main.py
+
+# consumer mode (redis stream -> gateway /index/bulk)
+LUMINA_REDIS_URL=redis://localhost:6379/0 \
+python redis_stream_worker.py
+```
+
+## Wikipedia dump parser
+
+For large Wikipedia dumps, use the streaming parser without loading the full file into memory:
+
+```bash
+cd services/crawler
+pip install -r requirements.txt
+
+# stream parse XML dump and directly bulk-index to gateway
+python wikipedia_dump_parser.py \
+  --input /path/to/ruwiki-latest-pages-articles.xml.bz2 \
+  --format xml \
+  --language ru \
+  --post-to-gateway \
+  --gateway-bulk-url http://localhost:8000/index/bulk \
+  --bulk-size 64
+
+# stream parse Parquet dump and write JSONL
+python wikipedia_dump_parser.py \
+  --input /path/to/wiki.parquet \
+  --format parquet \
+  --language en \
+  --output-jsonl ./wikipedia.jsonl
+```
 
 ## Frontend
 Run the SPA locally after installing dependencies:
@@ -70,7 +107,6 @@ Search results support incremental loading via a **Load more** button (10 result
 ## Current status
 This repository now contains the **distributed architecture scaffold**, but not yet:
 - production-grade frontier management / politeness controls for crawling,
-- dump-based Wikipedia ingestion,
 - production deployment hardening for the frontend.
 
 
