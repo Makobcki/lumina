@@ -12,6 +12,7 @@ interface SearchResult {
   url: string;
   snippet: string;
   source?: string;
+  indexed_at?: string | null;
 }
 
 interface SearchResponse {
@@ -52,9 +53,52 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [visibleLimit, setVisibleLimit] = useState(PAGE_SIZE);
   const [lastSearchQuery, setLastSearchQuery] = useState('');
+  const [selectedSource, setSelectedSource] = useState('all');
+  const [indexedFrom, setIndexedFrom] = useState('');
+  const [indexedTo, setIndexedTo] = useState('');
 
   const hasResults = results.length > 0;
   const canLoadMore = results.length >= visibleLimit;
+  const availableSources = useMemo(
+    () => ['all', ...Array.from(new Set(results.map((result) => result.source).filter((source): source is string => Boolean(source))))],
+    [results],
+  );
+  const filteredResults = useMemo(() => {
+    return results.filter((result) => {
+      if (selectedSource !== 'all' && result.source !== selectedSource) {
+        return false;
+      }
+
+      if (!indexedFrom && !indexedTo) {
+        return true;
+      }
+
+      if (!result.indexed_at) {
+        return false;
+      }
+
+      const indexedDate = new Date(result.indexed_at);
+      if (Number.isNaN(indexedDate.getTime())) {
+        return false;
+      }
+
+      if (indexedFrom) {
+        const fromDate = new Date(`${indexedFrom}T00:00:00.000Z`);
+        if (indexedDate < fromDate) {
+          return false;
+        }
+      }
+
+      if (indexedTo) {
+        const toDate = new Date(`${indexedTo}T23:59:59.999Z`);
+        if (indexedDate > toDate) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }, [indexedFrom, indexedTo, results, selectedSource]);
   const containerClassName = useMemo(
     () =>
       hasResults
@@ -95,6 +139,9 @@ function App() {
       setVisibleLimit(PAGE_SIZE);
       setLastSearchQuery(trimmedQuery);
       setResults(payload.results);
+      setSelectedSource('all');
+      setIndexedFrom('');
+      setIndexedTo('');
     } catch (requestError) {
       const message = requestError instanceof Error ? requestError.message : 'Unknown search error';
       setResults([]);
@@ -160,7 +207,44 @@ function App() {
 
         {hasResults ? (
           <div className="mt-8 space-y-4">
-            {results.map((result) => (
+            <section className="rounded-3xl border border-white/10 bg-slate-900/50 p-4">
+              <div className="grid gap-3 sm:grid-cols-3">
+                <label className="flex flex-col gap-1 text-sm text-slate-300">
+                  Source
+                  <select
+                    value={selectedSource}
+                    onChange={(event) => setSelectedSource(event.target.value)}
+                    className="min-h-11 rounded-xl border border-white/10 bg-slate-950/80 px-3 text-slate-100 outline-none transition focus:border-sky-400"
+                  >
+                    {availableSources.map((source) => (
+                      <option key={source} value={source}>
+                        {source}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1 text-sm text-slate-300">
+                  Indexed from
+                  <input
+                    type="date"
+                    value={indexedFrom}
+                    onChange={(event) => setIndexedFrom(event.target.value)}
+                    className="min-h-11 rounded-xl border border-white/10 bg-slate-950/80 px-3 text-slate-100 outline-none transition focus:border-sky-400"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-sm text-slate-300">
+                  Indexed to
+                  <input
+                    type="date"
+                    value={indexedTo}
+                    onChange={(event) => setIndexedTo(event.target.value)}
+                    className="min-h-11 rounded-xl border border-white/10 bg-slate-950/80 px-3 text-slate-100 outline-none transition focus:border-sky-400"
+                  />
+                </label>
+              </div>
+            </section>
+
+            {filteredResults.map((result) => (
               <article key={result.id} className="rounded-3xl border border-white/10 bg-slate-900/60 p-6 shadow-lg shadow-slate-950/20 backdrop-blur">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                   <div>
@@ -177,6 +261,9 @@ function App() {
                   <div className="text-sm text-slate-400">
                     <span>Score: {result.score.toFixed(4)}</span>
                     {result.source ? <span className="ml-3">Source: {result.source}</span> : null}
+                    {result.indexed_at ? (
+                      <span className="ml-3">Indexed: {new Date(result.indexed_at).toLocaleDateString()}</span>
+                    ) : null}
                   </div>
                 </div>
                 <p className="mt-4 whitespace-pre-line text-sm leading-7 text-slate-200">
@@ -184,6 +271,12 @@ function App() {
                 </p>
               </article>
             ))}
+
+            {!filteredResults.length ? (
+              <div className="rounded-3xl border border-white/10 bg-slate-900/50 p-6 text-center text-slate-300">
+                No results match the selected metadata filters.
+              </div>
+            ) : null}
 
             {canLoadMore ? (
               <div className="flex justify-center pt-2">
