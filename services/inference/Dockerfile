@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.12-slim
 
 ARG LUMINA_EMBED_MODEL=BAAI/bge-m3
