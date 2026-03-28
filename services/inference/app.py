@@ -8,9 +8,13 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Literal
 
+import structlog
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
+
+load_dotenv()
 
 VECTOR_SIZE = int(os.getenv("LUMINA_VECTOR_SIZE", "1024"))
 MODEL_NAME = os.getenv("LUMINA_EMBED_MODEL", "BAAI/bge-m3")
@@ -23,8 +27,24 @@ RERANK_CONCURRENCY_LIMIT = int(os.getenv("LUMINA_RERANK_CONCURRENCY", "1"))
 SPARSE_VOCAB_SIZE = int(os.getenv("LUMINA_SPARSE_VOCAB_SIZE", "200000"))
 SPARSE_MIN_TOKEN_LEN = int(os.getenv("LUMINA_SPARSE_MIN_TOKEN_LEN", "2"))
 
-logger = logging.getLogger("lumina.inference")
-logging.basicConfig(level=os.getenv("LUMINA_LOG_LEVEL", "INFO"))
+def _configure_logging() -> None:
+    logging.basicConfig(format="%(message)s", level=os.getenv("LUMINA_LOG_LEVEL", "INFO"), force=True)
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.JSONRenderer(),
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+
+_configure_logging()
+logger = structlog.get_logger("lumina.inference")
 
 
 class EmbedRequest(BaseModel):
@@ -141,10 +161,10 @@ async def _embed_worker(app: FastAPI) -> None:
     queue: asyncio.Queue[EmbedJob] = app.state.embed_queue
     batch_timeout = EMBED_BATCH_TIMEOUT_MS / 1000
     logger.info(
-        "Embed worker started (batch_size=%s, timeout=%sms, concurrency=%s)",
-        EMBED_MAX_BATCH_SIZE,
-        EMBED_BATCH_TIMEOUT_MS,
-        EMBED_CONCURRENCY_LIMIT,
+        "embed_worker_started",
+        batch_size=EMBED_MAX_BATCH_SIZE,
+        timeout_ms=EMBED_BATCH_TIMEOUT_MS,
+        concurrency=EMBED_CONCURRENCY_LIMIT,
     )
 
     while True:
@@ -172,13 +192,13 @@ async def _embed_worker(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Loading embedding model '%s' on device '%s'", MODEL_NAME, MODEL_DEVICE)
+    logger.info("loading_embedding_model", model=MODEL_NAME, device=MODEL_DEVICE)
     model = SentenceTransformer(MODEL_NAME, device=MODEL_DEVICE)
     embedding_dimension = model.get_sentence_embedding_dimension()
     if embedding_dimension is None:
         raise RuntimeError(f"Unable to determine embedding dimension for model '{MODEL_NAME}'")
 
-    logger.info("Loading reranker model '%s' on device '%s'", RERANKER_NAME, MODEL_DEVICE)
+    logger.info("loading_reranker_model", model=RERANKER_NAME, device=MODEL_DEVICE)
     reranker = CrossEncoder(RERANKER_NAME, device=MODEL_DEVICE)
 
     app.state.model = model
@@ -190,10 +210,10 @@ async def lifespan(app: FastAPI):
     app.state.embed_worker = asyncio.create_task(_embed_worker(app))
 
     logger.info(
-        "Inference models loaded: embed='%s' (vector size %s), reranker='%s'",
-        MODEL_NAME,
-        embedding_dimension,
-        RERANKER_NAME,
+        "inference_models_loaded",
+        embed_model=MODEL_NAME,
+        vector_size=embedding_dimension,
+        reranker_model=RERANKER_NAME,
     )
     try:
         yield

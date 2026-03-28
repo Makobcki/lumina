@@ -20,8 +20,11 @@ Distributed search engine baseline for Wikipedia and IT documentation.
 
 ## Quick start
 ```bash
+cp .env .env.local  # optional backup for local overrides
 docker compose up --build
 ```
+
+> Compose now uses service-specific `Dockerfile` builds and reads runtime URLs from `.env`.
 
 Then check:
 - Gateway: `http://localhost:8000/health`
@@ -38,7 +41,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The crawler fetches a small set of seed URLs, removes noisy HTML, chunks text, and pushes each chunk to `POST /index` on the gateway.
+The crawler fetches a small set of seed URLs, removes noisy HTML, chunks text, and pushes each chunk to `POST /index` on the gateway (`LUMINA_GATEWAY_INDEX_URL` from `.env`). Gateway calls to `/index` are retried with exponential backoff via `tenacity`.
 
 ## Frontend
 Run the SPA locally after installing dependencies:
@@ -67,3 +70,9 @@ This repository now contains the **distributed architecture scaffold**, but not 
 - production-grade frontier management / politeness controls for crawling,
 - dump-based Wikipedia ingestion,
 - production deployment hardening for the frontend.
+
+
+## Healthchecks and startup ordering
+- `postgres`, `qdrant`, `inference`, and `gateway` now expose Docker healthchecks.
+- `gateway` starts only after `postgres`, `qdrant`, and `inference` report healthy status.
+- Services emit structured JSON logs (via `structlog`) for easier ingestion into centralized observability stacks.

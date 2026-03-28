@@ -8,12 +8,16 @@ from uuid import uuid4
 
 import asyncpg
 import httpx
+import structlog
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models
 from qdrant_client.models import Distance, PointStruct, VectorParams
+
+load_dotenv()
 
 INFERENCE_URL = os.getenv("LUMINA_INFERENCE_URL", "http://inference:8001")
 QDRANT_URL = os.getenv("LUMINA_QDRANT_URL", "http://qdrant:6333")
@@ -28,8 +32,24 @@ MAX_RERANK_CANDIDATES = int(os.getenv("LUMINA_MAX_RERANK_CANDIDATES", "30"))
 DENSE_VECTOR_NAME = os.getenv("LUMINA_QDRANT_DENSE_VECTOR_NAME", "dense")
 SPARSE_VECTOR_NAME = os.getenv("LUMINA_QDRANT_SPARSE_VECTOR_NAME", "sparse")
 
-logger = logging.getLogger("lumina.gateway")
-logging.basicConfig(level=os.getenv("LUMINA_LOG_LEVEL", "INFO"))
+def _configure_logging() -> None:
+    logging.basicConfig(format="%(message)s", level=os.getenv("LUMINA_LOG_LEVEL", "INFO"), force=True)
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.JSONRenderer(),
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+
+_configure_logging()
+logger = structlog.get_logger("lumina.gateway")
 
 
 class IndexRequest(BaseModel):
@@ -109,14 +129,14 @@ async def lifespan(app: FastAPI):
             },
         )
         logger.info(
-            "Created Qdrant collection '%s' with dense='%s' (size=%s) and sparse='%s'",
-            COLLECTION_NAME,
-            DENSE_VECTOR_NAME,
-            VECTOR_SIZE,
-            SPARSE_VECTOR_NAME,
+            "qdrant_collection_created",
+            collection=COLLECTION_NAME,
+            dense_vector=DENSE_VECTOR_NAME,
+            vector_size=VECTOR_SIZE,
+            sparse_vector=SPARSE_VECTOR_NAME,
         )
     else:
-        logger.info("Qdrant collection '%s' already exists", COLLECTION_NAME)
+        logger.info("qdrant_collection_exists", collection=COLLECTION_NAME)
 
     yield
 

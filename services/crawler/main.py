@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -9,11 +10,16 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
+import structlog
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-GATEWAY_INDEX_URL = "http://localhost:8000/index"
-REQUEST_TIMEOUT_SECONDS = 30.0
+load_dotenv()
+
+GATEWAY_INDEX_URL = os.getenv("LUMINA_GATEWAY_INDEX_URL", "http://localhost:8000/index")
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("LUMINA_REQUEST_TIMEOUT_SECONDS", "30.0"))
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 MAX_CONCURRENT_FETCHES = 20
@@ -37,8 +43,24 @@ REMOVABLE_TAGS = {
     "aside",
 }
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-logger = logging.getLogger("lumina.crawler")
+def _configure_logging() -> None:
+    logging.basicConfig(format="%(message)s", level=os.getenv("LUMINA_LOG_LEVEL", "INFO"), force=True)
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.JSONRenderer(),
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+
+_configure_logging()
+logger = structlog.get_logger("lumina.crawler")
 
 
 @dataclass(slots=True)
@@ -86,7 +108,7 @@ class PolitenessPolicy:
                 parser.set_url(robots_url)
                 parser.parse(response.text.splitlines())
         except httpx.HTTPError:
-            logger.warning("Could not fetch robots.txt for %s", domain)
+            logger.warning("could_not_fetch_robots", domain=domain)
 
         async with self._robots_lock:
             self._robots_parsers[domain] = parser
@@ -118,12 +140,19 @@ async def fetch_and_clean(
     politeness_policy: PolitenessPolicy,
 ) -> tuple[str, str] | None:
     if not await politeness_policy.can_fetch(url=url, client=client):
-        logger.warning("robots.txt disallows crawling %s", url)
+        logger.warning("robots_txt_disallows_crawling", url=url)
         return None
 
     await politeness_policy.wait_turn(url)
-    response = await client.get(url, follow_redirects=True)
-    response.raise_for_status()
+    async for attempt in AsyncRetrying(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=6),
+        retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+        reraise=True,
+    ):
+        with attempt:
+            response = await client.get(url, follow_redirects=True)
+            response.raise_for_status()
 
     return await asyncio.to_thread(_extract_title_and_text, response.text, url)
 
@@ -152,9 +181,16 @@ async def index_chunks(
             "content": chunk,
         }
         async with semaphore:
-            response = await client.post(GATEWAY_INDEX_URL, json=payload)
-            response.raise_for_status()
-            logger.info("Indexed %s chunk %s", url, chunk_index)
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(5),
+                wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+                retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await client.post(GATEWAY_INDEX_URL, json=payload)
+                    response.raise_for_status()
+            logger.info("chunk_indexed", url=url, chunk_index=chunk_index)
 
     tasks = [index_one(chunk_index=index, chunk=chunk) for index, chunk in enumerate(chunks, start=1)]
     if tasks:
@@ -168,14 +204,14 @@ async def crawl_and_index(
     politeness_policy: PolitenessPolicy,
     indexing_semaphore: asyncio.Semaphore,
 ) -> None:
-    logger.info("Fetching %s", url)
+    logger.info("fetching_url", url=url)
     result = await fetch_and_clean(url=url, client=fetch_client, politeness_policy=politeness_policy)
     if result is None:
         return
 
     title, text = result
     chunks = chunk_text(text)
-    logger.info("Prepared %s chunks for %s", len(chunks), url)
+    logger.info("chunks_prepared", chunk_count=len(chunks), url=url)
     await index_chunks(url=url, title=title, chunks=chunks, client=gateway_client, semaphore=indexing_semaphore)
 
 
@@ -205,7 +241,7 @@ async def run_crawler(urls: list[str]) -> None:
 
     for url, result in zip(urls, results, strict=True):
         if isinstance(result, Exception):
-            logger.error("Failed to process %s: %s", url, result)
+            logger.error("crawl_failed", url=url, error=str(result))
 
 
 if __name__ == "__main__":
