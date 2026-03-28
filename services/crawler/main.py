@@ -18,10 +18,11 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 
 load_dotenv()
 
-GATEWAY_INDEX_URL = os.getenv("LUMINA_GATEWAY_INDEX_URL", "http://localhost:8000/index")
+GATEWAY_BULK_INDEX_URL = os.getenv("LUMINA_GATEWAY_BULK_INDEX_URL", "http://localhost:8000/index/bulk")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("LUMINA_REQUEST_TIMEOUT_SECONDS", "30.0"))
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
+INDEX_BULK_SIZE = int(os.getenv("LUMINA_INDEX_BULK_SIZE", "64"))
 MAX_CONCURRENT_FETCHES = 20
 MAX_CONCURRENT_INDEX_REQUESTS = 20
 USER_AGENT = "lumina-crawler/1.0"
@@ -174,12 +175,23 @@ async def index_chunks(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
 ) -> None:
-    async def index_one(chunk_index: int, chunk: str) -> None:
-        payload = {
-            "title": f"{title} [chunk {chunk_index}]",
-            "url": url,
-            "content": chunk,
-        }
+    chunk_list = list(chunks)
+    if not chunk_list:
+        return
+
+    if INDEX_BULK_SIZE < 1:
+        raise ValueError("LUMINA_INDEX_BULK_SIZE must be >= 1")
+
+    async def index_bulk(batch_start_index: int, batch_chunks: list[str]) -> None:
+        documents = [
+            {
+                "title": f"{title} [chunk {chunk_index}]",
+                "url": url,
+                "content": chunk,
+            }
+            for chunk_index, chunk in enumerate(batch_chunks, start=batch_start_index)
+        ]
+        payload = {"documents": documents}
         async with semaphore:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(5),
@@ -188,11 +200,23 @@ async def index_chunks(
                 reraise=True,
             ):
                 with attempt:
-                    response = await client.post(GATEWAY_INDEX_URL, json=payload)
+                    response = await client.post(GATEWAY_BULK_INDEX_URL, json=payload)
                     response.raise_for_status()
-            logger.info("chunk_indexed", url=url, chunk_index=chunk_index)
+            logger.info(
+                "chunks_indexed_bulk",
+                url=url,
+                chunk_start=batch_start_index,
+                chunk_end=batch_start_index + len(batch_chunks) - 1,
+                chunk_count=len(batch_chunks),
+            )
 
-    tasks = [index_one(chunk_index=index, chunk=chunk) for index, chunk in enumerate(chunks, start=1)]
+    tasks = [
+        index_bulk(
+            batch_start_index=start_index + 1,
+            batch_chunks=chunk_list[start_index : start_index + INDEX_BULK_SIZE],
+        )
+        for start_index in range(0, len(chunk_list), INDEX_BULK_SIZE)
+    ]
     if tasks:
         await asyncio.gather(*tasks)
 

@@ -55,6 +55,17 @@ This baseline is **not interrupt-safe** in the kernel-space sense; it is user-sp
 - **API Gateway** as the public entrypoint.
 - **Frontend** served by Nginx/React.
 
+### Wikipedia dump ingestion path
+- `services/crawler/wikipedia_dump_parser.py` supports streaming XML (`iterparse`) and Parquet (`pyarrow.dataset` batch scanner) without loading full dumps into RAM.
+- Gateway exposes `/index/bulk` for batch document ingestion (`documents: IndexRequest[]`) and writes both raw content (PostgreSQL) and vectors (Qdrant) in one request cycle.
+- Crawler uses `/index/bulk` with configurable `LUMINA_INDEX_BULK_SIZE` to reduce per-chunk request overhead during high-volume indexing.
+- Queue-based buffering (RabbitMQ / Redis Streams) remains an optional extension point between parser/crawler and gateway.
+
+### Container build/startup optimization
+- Service Dockerfiles use `uv` for dependency installation. This works both with legacy builder and BuildKit.
+- Inference image preloads embedding and reranker models at build time to avoid repeated cold-start downloads on container startup.
+- `docker-compose.yml` configures local BuildKit cache import/export for `inference` and `gateway` images (effective when BuildKit is enabled) and mounts a shared Hugging Face cache volume (`hf_cache`) for runtime reuse.
+
 ## Search contract
 1. Client calls gateway `/search` with text query.
 2. Gateway calls inference `/embed` and `/embed/sparse` on Node A.
