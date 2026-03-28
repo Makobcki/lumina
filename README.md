@@ -41,7 +41,19 @@ npm install
 npm run dev
 ```
 
-The frontend talks directly to the gateway search API at `http://localhost:8000/search`.
+The frontend talks to the gateway search API via `VITE_API_URL` (for example, an external IP in production).
+
+Examples:
+```bash
+# local default
+npm run dev
+
+# custom gateway URL
+VITE_API_URL=http://203.0.113.10:8000 npm run build
+```
+
+If `VITE_API_URL` is not set, the app falls back to `http://localhost:8000`.
+Search results support incremental loading via a **Load more** button (10 results per page).
 
 ## Current status
 This repository now contains the **distributed architecture scaffold**, but not yet:
