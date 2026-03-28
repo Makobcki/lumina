@@ -9,6 +9,12 @@ services:
     volumes:
       - ./infra/qdrant/config.yaml:/qdrant/config/production.yaml:ro
       - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   postgres:
     image: postgres:17-alpine
@@ -20,40 +26,51 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumina -d lumina"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   inference:
-    image: python:3.12-slim
-    working_dir: /app
-    command: >-
-      sh -c "pip install --no-cache-dir . &&
-             uvicorn app:app --host 0.0.0.0 --port 8001"
+    build:
+      context: ./services/inference
+    env_file:
+      - .env
     environment:
       LUMINA_VECTOR_SIZE: "1024"
       LUMINA_EMBED_MODEL: "BAAI/bge-m3"
       LUMINA_RERANKER_MODEL: "BAAI/bge-reranker-v2-m3"
-    volumes:
-      - ./services/inference:/app
     ports:
       - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
 
   gateway:
-    image: python:3.12-slim
-    working_dir: /app
-    command: >-
-      sh -c "pip install --no-cache-dir -r requirements.txt &&
-             uvicorn app:app --host 0.0.0.0 --port 8000"
-    environment:
-      LUMINA_INFERENCE_URL: "http://inference:8001"
-      LUMINA_QDRANT_URL: "http://qdrant:6333"
-      LUMINA_POSTGRES_DSN: "postgresql://lumina:lumina@postgres:5432/lumina"
+    build:
+      context: ./services/gateway
+    env_file:
+      - .env
     depends_on:
-      - inference
-      - qdrant
-      - postgres
-    volumes:
-      - ./services/gateway:/app
+      inference:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
 volumes:
   qdrant_storage:
