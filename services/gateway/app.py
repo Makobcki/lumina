@@ -108,6 +108,15 @@ class HealthResponse(BaseModel):
     raw_storage: str
 
 
+class DeleteDocumentsResponse(BaseModel):
+    status: Literal["deleted"]
+    deleted_count: int
+    qdrant_deleted_count: int
+    postgres_deleted_count: int
+    filter_field: Literal["url", "source"]
+    filter_value: str
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     http_client = httpx.AsyncClient(timeout=30.0)
@@ -254,6 +263,22 @@ async def _fetch_raw_documents(request: Request, document_ids: list[str]) -> dic
     return {str(row["document_id"]): str(row["content"]) for row in rows}
 
 
+async def _delete_raw_documents(request: Request, document_ids: list[str]) -> int:
+    if not document_ids:
+        return 0
+
+    pool = _get_pg_pool(request)
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM raw_documents
+            WHERE document_id = ANY($1::text[])
+            """,
+            document_ids,
+        )
+    return int(result.split()[-1])
+
+
 async def _store_search_query(
     request: Request,
     *,
@@ -343,6 +368,75 @@ async def _sparse_embed_texts(request: Request, texts: list[str]) -> tuple[str, 
         for embedding in payload["embeddings"]
     ]
     return payload["model"], sparse_vectors
+
+
+async def _find_document_ids_by_payload_field(
+    request: Request,
+    *,
+    field_name: Literal["url", "source"],
+    field_value: str,
+) -> list[str]:
+    qdrant = _get_qdrant(request)
+    next_offset: models.PointId | None = None
+    document_ids: list[str] = []
+
+    while True:
+        points, next_offset = await qdrant.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key=field_name,
+                        match=models.MatchValue(value=field_value),
+                    )
+                ]
+            ),
+            limit=256,
+            with_payload=True,
+            with_vectors=False,
+            offset=next_offset,
+        )
+
+        if not points:
+            break
+
+        for point in points:
+            payload_data = dict(point.payload or {})
+            document_id = payload_data.get("document_id") or point.id
+            if document_id is None:
+                continue
+            document_ids.append(str(document_id))
+
+        if next_offset is None:
+            break
+
+    return _deduplicate_preserve_order(document_ids)
+
+
+async def _delete_documents_by_field(
+    request: Request,
+    *,
+    field_name: Literal["url", "source"],
+    field_value: str,
+) -> tuple[int, int, int]:
+    document_ids = await _find_document_ids_by_payload_field(
+        request,
+        field_name=field_name,
+        field_value=field_value,
+    )
+
+    if not document_ids:
+        return 0, 0, 0
+
+    qdrant = _get_qdrant(request)
+    await qdrant.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=models.PointIdsList(points=document_ids),
+    )
+
+    postgres_deleted_count = await _delete_raw_documents(request, document_ids)
+    deleted_count = len(document_ids)
+    return deleted_count, deleted_count, postgres_deleted_count
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -527,3 +621,43 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
         result_count=len(results),
     )
     return SearchResponse(query=payload.query, embedding_model=embedding_model, results=results)
+
+
+@app.delete("/documents", response_model=DeleteDocumentsResponse)
+async def delete_documents(
+    request: Request,
+    url: str | None = None,
+    source: str | None = None,
+) -> DeleteDocumentsResponse:
+    if bool(url) == bool(source):
+        raise HTTPException(status_code=422, detail="Provide exactly one of: url or source")
+
+    if url is not None:
+        filter_field: Literal["url", "source"] = "url"
+        filter_value = url
+    else:
+        filter_field = "source"
+        filter_value = str(source)
+
+    deleted_count, qdrant_deleted_count, postgres_deleted_count = await _delete_documents_by_field(
+        request,
+        field_name=filter_field,
+        field_value=filter_value,
+    )
+
+    logger.info(
+        "documents_deleted",
+        filter_field=filter_field,
+        filter_value=filter_value,
+        deleted_count=deleted_count,
+        qdrant_deleted_count=qdrant_deleted_count,
+        postgres_deleted_count=postgres_deleted_count,
+    )
+    return DeleteDocumentsResponse(
+        status="deleted",
+        deleted_count=deleted_count,
+        qdrant_deleted_count=qdrant_deleted_count,
+        postgres_deleted_count=postgres_deleted_count,
+        filter_field=filter_field,
+        filter_value=filter_value,
+    )
