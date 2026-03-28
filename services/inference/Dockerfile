@@ -15,12 +15,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    pip install --no-cache-dir uv==0.8.13 \
+RUN pip install --no-cache-dir uv==0.8.13 \
     && uv pip install --system -r requirements.txt
 
-RUN --mount=type=cache,target=/models/huggingface \
-    python -c "import os; from sentence_transformers import CrossEncoder, SentenceTransformer; SentenceTransformer(os.environ['LUMINA_EMBED_MODEL'], device='cpu'); CrossEncoder(os.environ['LUMINA_RERANKER_MODEL'], device='cpu')"
+RUN python -c "import os; from sentence_transformers import CrossEncoder, SentenceTransformer; SentenceTransformer(os.environ['LUMINA_EMBED_MODEL'], device='cpu'); CrossEncoder(os.environ['LUMINA_RERANKER_MODEL'], device='cpu')"
 
 COPY app.py ./
 

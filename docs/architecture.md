@@ -62,9 +62,9 @@ This baseline is **not interrupt-safe** in the kernel-space sense; it is user-sp
 - Queue-based buffering (RabbitMQ / Redis Streams) remains an optional extension point between parser/crawler and gateway.
 
 ### Container build/startup optimization
-- Service Dockerfiles use `uv` for dependency installation and Docker BuildKit cache mounts (`--mount=type=cache`) to speed up iterative builds.
+- Service Dockerfiles use `uv` for dependency installation. This works both with legacy builder and BuildKit.
 - Inference image preloads embedding and reranker models at build time to avoid repeated cold-start downloads on container startup.
-- `docker-compose.yml` configures local BuildKit cache import/export for `inference` and `gateway` images and mounts a shared Hugging Face cache volume (`hf_cache`) for runtime reuse.
+- `docker-compose.yml` configures local BuildKit cache import/export for `inference` and `gateway` images (effective when BuildKit is enabled) and mounts a shared Hugging Face cache volume (`hf_cache`) for runtime reuse.
 
 ## Search contract
 1. Client calls gateway `/search` with text query.
