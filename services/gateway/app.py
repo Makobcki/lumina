@@ -66,6 +66,18 @@ class IndexResponse(BaseModel):
     embedding_model: str
 
 
+class BulkIndexRequest(BaseModel):
+    documents: list[IndexRequest] = Field(min_length=1, max_length=1000)
+
+
+class BulkIndexResponse(BaseModel):
+    ids: list[str]
+    indexed_count: int
+    status: Literal["indexed"]
+    collection: str
+    embedding_model: str
+
+
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     top_k: int = Field(default=10, ge=1, le=50)
@@ -191,6 +203,24 @@ async def _store_raw_document(request: Request, document_id: str, content: str) 
         )
 
 
+async def _store_raw_documents_bulk(request: Request, documents: list[tuple[str, str]]) -> None:
+    if not documents:
+        return
+
+    pool = _get_pg_pool(request)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.executemany(
+                """
+                INSERT INTO raw_documents (document_id, content)
+                VALUES ($1, $2)
+                ON CONFLICT (document_id)
+                DO UPDATE SET content = EXCLUDED.content
+                """,
+                documents,
+            )
+
+
 async def _fetch_raw_documents(request: Request, document_ids: list[str]) -> dict[str, str]:
     if not document_ids:
         return {}
@@ -270,6 +300,54 @@ async def index_document(request: Request, payload: IndexRequest) -> IndexRespon
     await qdrant.upsert(collection_name=COLLECTION_NAME, points=[point])
     return IndexResponse(
         id=document_id,
+        status="indexed",
+        collection=COLLECTION_NAME,
+        embedding_model=embedding_model,
+    )
+
+
+@app.post("/index/bulk", response_model=BulkIndexResponse)
+async def index_documents_bulk(request: Request, payload: BulkIndexRequest) -> BulkIndexResponse:
+    documents = payload.documents
+    contents = [document.content for document in documents]
+    embedding_model, embeddings = await _embed_texts(request, contents)
+    _, sparse_embeddings = await _sparse_embed_texts(request, contents)
+
+    document_ids = [document.id or str(uuid4()) for document in documents]
+    await _store_raw_documents_bulk(
+        request,
+        documents=[(document_id, document.content) for document_id, document in zip(document_ids, documents, strict=True)],
+    )
+
+    points = [
+        PointStruct(
+            id=document_id,
+            vector={
+                DENSE_VECTOR_NAME: dense_vector,
+                SPARSE_VECTOR_NAME: sparse_vector,
+            },
+            payload={
+                "title": document.title,
+                "url": document.url,
+                "document_id": document_id,
+                "source": "indexed",
+            },
+        )
+        for document_id, document, dense_vector, sparse_vector in zip(
+            document_ids,
+            documents,
+            embeddings,
+            sparse_embeddings,
+            strict=True,
+        )
+    ]
+
+    qdrant = _get_qdrant(request)
+    await qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+
+    return BulkIndexResponse(
+        ids=document_ids,
+        indexed_count=len(document_ids),
         status="indexed",
         collection=COLLECTION_NAME,
         embedding_model=embedding_model,
