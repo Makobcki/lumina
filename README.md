@@ -7,7 +7,7 @@ Distributed search engine baseline for Wikipedia and IT documentation.
 - `infra/qdrant/config.yaml` — Qdrant memory-oriented baseline with scalar quantization.
 - `services/inference` — FastAPI inference service with SentenceTransformer-based embeddings and reranker scaffold.
 - `services/gateway` — FastAPI gateway scaffold.
-- `docker-compose.yml` — local development topology for Qdrant + inference + gateway.
+- `docker-compose.yml` — local development topology for Qdrant + PostgreSQL (raw documents) + inference + gateway.
 - `services/crawler` — CLI crawler for fetching, cleaning, chunking, and indexing web pages through the gateway.
 - `frontend` — React + Vite + Tailwind SPA for search queries and result rendering.
 
@@ -15,7 +15,9 @@ Distributed search engine baseline for Wikipedia and IT documentation.
 - Gateway now indexes **two vector spaces** in Qdrant collection `documents`:
   - `dense` (semantic embedding from `/embed`)
   - `sparse` (BM25-hash sparse embedding from `/embed/sparse`)
+- Raw document `content` is stored in PostgreSQL (`raw_documents`); Qdrant payload keeps only hot metadata (`title`, `url`, `document_id`, `source`).
 - `/search` executes Qdrant `query_points` with `prefetch` for both spaces and `Fusion.RRF`.
+- After vector retrieval, gateway performs a bulk lookup by `document_id` in PostgreSQL and sends only retrieved candidate texts to `/rerank`.
 - This improves ranking for exact technical terms (e.g., `FastAPI CORSMiddleware`) while preserving semantic recall.
 
 ## Quick start

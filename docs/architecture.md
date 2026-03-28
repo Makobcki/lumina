@@ -69,9 +69,10 @@ This baseline is **not interrupt-safe** in the kernel-space sense; it is user-sp
 ## Search contract
 1. Client calls gateway `/search` with text query.
 2. Gateway calls inference `/embed` and `/embed/sparse` on Node A.
-3. Gateway calls Qdrant hybrid search using `prefetch` (dense + sparse) and `Fusion.RRF`.
-4. Top-K candidates are reranked via reranker model.
-5. Gateway returns ranked results plus metadata.
+3. Gateway calls Qdrant hybrid search using `prefetch` (dense + sparse) and `Fusion.RRF`; payload in Qdrant contains only hot metadata (`title`, `url`, `document_id`, `source`) without raw `content`.
+4. Gateway performs bulk point lookup in raw storage (PostgreSQL) by `document_id` for retrieved candidates.
+5. Retrieved raw texts are passed to reranker model.
+6. Gateway returns ranked results plus metadata and snippets.
 
 ### Complexity and latency targets
 - Embedding: `O(tokens)` per query.
@@ -86,11 +87,18 @@ This baseline is **not interrupt-safe** in the kernel-space sense; it is user-sp
 ## Schema baseline
 | Field | Type | Index | Description |
 | --- | --- | --- | --- |
-| `id` | UUID | Primary | Stable document/chunk ID |
-| `title` | String | Full-text | Document title |
-| `content` | Text | No | Full chunk body, preferably outside hot RAM path |
+| `id` | UUID/Text | Primary | Stable point ID (matches `document_id`) |
 | `vector` | Vector(1024) | HNSW + int8 | Dense semantic embedding |
-| `metadata` | JSON | Payload | URL, source, timestamps, tags |
+| `sparse_vector` | SparseVector | Inverted | Sparse lexical embedding |
+| `metadata` | JSON | Payload | `title`, `url`, `document_id`, `source` (without `content`) |
+
+Raw storage (PostgreSQL `raw_documents`) keeps:
+
+| Field | Type | Index | Description |
+| --- | --- | --- | --- |
+| `document_id` | Text | Primary | Stable document/chunk ID |
+| `content` | Text | No | Full chunk body used only for reranking/snippets |
+| `created_at` | TIMESTAMPTZ | Optional | Ingestion timestamp |
 
 ## Qdrant configuration baseline
 ```yaml
