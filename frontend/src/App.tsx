@@ -1,5 +1,10 @@
 import { FormEvent, useMemo, useState } from 'react';
 
+const PAGE_SIZE = 10;
+const DEFAULT_API_URL = 'http://localhost:8000';
+const API_BASE_URL = (import.meta.env.VITE_API_URL || DEFAULT_API_URL).replace(/\/$/, '');
+const SEARCH_ENDPOINT = `${API_BASE_URL}/search`;
+
 interface SearchResult {
   id: string;
   title: string;
@@ -14,7 +19,30 @@ interface SearchResponse {
   results: SearchResult[];
 }
 
-const SEARCH_ENDPOINT = 'http://localhost:8000/search';
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function highlightSnippet(snippet: string, query: string) {
+  const terms = Array.from(new Set(query.trim().split(/\s+/).filter(Boolean)));
+  if (!terms.length) {
+    return snippet;
+  }
+
+  const pattern = new RegExp(`(${terms.map(escapeRegExp).join('|')})`, 'gi');
+  const termSet = new Set(terms.map((term) => term.toLowerCase()));
+  const parts = snippet.split(pattern);
+
+  return parts.map((part, index) =>
+    termSet.has(part.toLowerCase()) ? (
+      <mark key={`${part}-${index}`} className="rounded bg-sky-400/30 px-0.5 text-sky-100">
+        {part}
+      </mark>
+    ) : (
+      <span key={`${part}-${index}`}>{part}</span>
+    ),
+  );
+}
 
 function App() {
   const [query, setQuery] = useState('');
@@ -22,8 +50,11 @@ function App() {
   const [isSearching, setIsSearching] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [visibleLimit, setVisibleLimit] = useState(PAGE_SIZE);
+  const [lastSearchQuery, setLastSearchQuery] = useState('');
 
   const hasResults = results.length > 0;
+  const canLoadMore = results.length >= visibleLimit;
   const containerClassName = useMemo(
     () =>
       hasResults
@@ -31,6 +62,22 @@ function App() {
         : 'flex min-h-screen items-center justify-center px-4 py-8',
     [hasResults],
   );
+
+  async function performSearch(searchQuery: string, topK: number) {
+    const response = await fetch(SEARCH_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query: searchQuery, top_k: topK }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Search request failed with status ${response.status}`);
+    }
+
+    return (await response.json()) as SearchResponse;
+  }
 
   async function handleSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -44,23 +91,30 @@ function App() {
     setHasSearched(true);
 
     try {
-      const response = await fetch(SEARCH_ENDPOINT, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query: trimmedQuery, top_k: 10 }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Search request failed with status ${response.status}`);
-      }
-
-      const payload: SearchResponse = await response.json();
+      const payload = await performSearch(trimmedQuery, PAGE_SIZE);
+      setVisibleLimit(PAGE_SIZE);
+      setLastSearchQuery(trimmedQuery);
       setResults(payload.results);
     } catch (requestError) {
       const message = requestError instanceof Error ? requestError.message : 'Unknown search error';
       setResults([]);
+      setError(message);
+    } finally {
+      setIsSearching(false);
+    }
+  }
+
+  async function handleLoadMore() {
+    const nextLimit = visibleLimit + PAGE_SIZE;
+    setIsSearching(true);
+    setError(null);
+
+    try {
+      const payload = await performSearch(lastSearchQuery, nextLimit);
+      setVisibleLimit(nextLimit);
+      setResults(payload.results);
+    } catch (requestError) {
+      const message = requestError instanceof Error ? requestError.message : 'Unknown search error';
       setError(message);
     } finally {
       setIsSearching(false);
@@ -125,9 +179,24 @@ function App() {
                     {result.source ? <span className="ml-3">Source: {result.source}</span> : null}
                   </div>
                 </div>
-                <p className="mt-4 whitespace-pre-line text-sm leading-7 text-slate-200">{result.snippet}</p>
+                <p className="mt-4 whitespace-pre-line text-sm leading-7 text-slate-200">
+                  {highlightSnippet(result.snippet, lastSearchQuery)}
+                </p>
               </article>
             ))}
+
+            {canLoadMore ? (
+              <div className="flex justify-center pt-2">
+                <button
+                  type="button"
+                  disabled={isSearching}
+                  onClick={handleLoadMore}
+                  className="rounded-2xl border border-sky-400/40 bg-slate-900/80 px-6 py-3 text-sm font-medium text-sky-200 transition hover:border-sky-300 hover:text-sky-100 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isSearching ? 'Loading…' : 'Load more'}
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : hasSearched && !isSearching ? (
           <div className="mt-8 rounded-3xl border border-white/10 bg-slate-900/50 p-6 text-center text-slate-300">
