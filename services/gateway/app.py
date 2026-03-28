@@ -188,19 +188,21 @@ def _get_pg_pool(request: Request) -> asyncpg.Pool:
     return pool
 
 
-async def _store_raw_document(request: Request, document_id: str, content: str) -> None:
+async def _store_raw_document(request: Request, document_id: str, content: str) -> str:
     pool = _get_pg_pool(request)
     async with pool.acquire() as conn:
-        await conn.execute(
+        stored_document_id = await conn.fetchval(
             """
             INSERT INTO raw_documents (document_id, content)
             VALUES ($1, $2)
             ON CONFLICT (document_id)
             DO UPDATE SET content = EXCLUDED.content
+            RETURNING document_id
             """,
             document_id,
             content,
         )
+    return str(stored_document_id)
 
 
 async def _store_raw_documents_bulk(request: Request, documents: list[tuple[str, str]]) -> None:
@@ -237,6 +239,17 @@ async def _fetch_raw_documents(request: Request, document_ids: list[str]) -> dic
         )
 
     return {str(row["document_id"]): str(row["content"]) for row in rows}
+
+
+def _deduplicate_preserve_order(values: list[str]) -> list[str]:
+    deduplicated_values: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduplicated_values.append(value)
+    return deduplicated_values
 
 
 async def _post_inference(request: Request, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -280,10 +293,10 @@ async def index_document(request: Request, payload: IndexRequest) -> IndexRespon
     _, sparse_embeddings = await _sparse_embed_texts(request, [payload.content])
     document_id = payload.id or str(uuid4())
 
-    await _store_raw_document(request, document_id=document_id, content=payload.content)
+    stored_document_id = await _store_raw_document(request, document_id=document_id, content=payload.content)
 
     point = PointStruct(
-        id=document_id,
+        id=stored_document_id,
         vector={
             DENSE_VECTOR_NAME: embeddings[0],
             SPARSE_VECTOR_NAME: sparse_embeddings[0],
@@ -291,7 +304,7 @@ async def index_document(request: Request, payload: IndexRequest) -> IndexRespon
         payload={
             "title": payload.title,
             "url": payload.url,
-            "document_id": document_id,
+            "document_id": stored_document_id,
             "source": "indexed",
         },
     )
@@ -299,7 +312,7 @@ async def index_document(request: Request, payload: IndexRequest) -> IndexRespon
     qdrant = _get_qdrant(request)
     await qdrant.upsert(collection_name=COLLECTION_NAME, points=[point])
     return IndexResponse(
-        id=document_id,
+        id=stored_document_id,
         status="indexed",
         collection=COLLECTION_NAME,
         embedding_model=embedding_model,
@@ -395,10 +408,11 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
     if not candidate_ids:
         return SearchResponse(query=payload.query, embedding_model=embedding_model, results=[])
 
-    raw_documents = await _fetch_raw_documents(request, candidate_ids)
+    unique_candidate_ids = _deduplicate_preserve_order(candidate_ids)
+    raw_documents = await _fetch_raw_documents(request, unique_candidate_ids)
 
     rerank_documents: list[dict[str, str | None]] = []
-    for candidate_id in candidate_ids:
+    for candidate_id in unique_candidate_ids:
         text = raw_documents.get(candidate_id)
         if not text:
             continue
