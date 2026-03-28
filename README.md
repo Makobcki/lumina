@@ -11,6 +11,13 @@ Distributed search engine baseline for Wikipedia and IT documentation.
 - `services/crawler` — CLI crawler for fetching, cleaning, chunking, and indexing web pages through the gateway.
 - `frontend` — React + Vite + Tailwind SPA for search queries and result rendering.
 
+## Hybrid retrieval (Dense + Sparse)
+- Gateway now indexes **two vector spaces** in Qdrant collection `documents`:
+  - `dense` (semantic embedding from `/embed`)
+  - `sparse` (BM25-hash sparse embedding from `/embed/sparse`)
+- `/search` executes Qdrant `query_points` with `prefetch` for both spaces and `Fusion.RRF`.
+- This improves ranking for exact technical terms (e.g., `FastAPI CORSMiddleware`) while preserving semantic recall.
+
 ## Quick start
 ```bash
 docker compose up --build

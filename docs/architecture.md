@@ -57,8 +57,8 @@ This baseline is **not interrupt-safe** in the kernel-space sense; it is user-sp
 
 ## Search contract
 1. Client calls gateway `/search` with text query.
-2. Gateway calls inference `/embed` on Node A.
-3. Gateway (or inference/orchestrator) calls Qdrant hybrid search.
+2. Gateway calls inference `/embed` and `/embed/sparse` on Node A.
+3. Gateway calls Qdrant hybrid search using `prefetch` (dense + sparse) and `Fusion.RRF`.
 4. Top-K candidates are reranked via reranker model.
 5. Gateway returns ranked results plus metadata.
 
