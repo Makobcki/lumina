@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -90,6 +91,7 @@ class SearchResult(BaseModel):
     source: str
     url: str
     snippet: str
+    indexed_at: str | None = None
 
 
 class SearchResponse(BaseModel):
@@ -123,6 +125,17 @@ async def lifespan(app: FastAPI):
                 document_id TEXT PRIMARY KEY,
                 content TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_query_history (
+                id BIGSERIAL PRIMARY KEY,
+                query TEXT NOT NULL,
+                top_k INTEGER NOT NULL,
+                result_count INTEGER NOT NULL,
+                searched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
@@ -241,6 +254,34 @@ async def _fetch_raw_documents(request: Request, document_ids: list[str]) -> dic
     return {str(row["document_id"]): str(row["content"]) for row in rows}
 
 
+async def _store_search_query(
+    request: Request,
+    *,
+    query: str,
+    top_k: int,
+    result_count: int,
+) -> None:
+    pool = _get_pg_pool(request)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO search_query_history (query, top_k, result_count)
+            VALUES ($1, $2, $3)
+            """,
+            query,
+            top_k,
+            result_count,
+        )
+
+
+def _coerce_indexed_at(payload_data: dict[str, Any]) -> str | None:
+    raw_value = payload_data.get("indexed_at")
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    return value or None
+
+
 def _deduplicate_preserve_order(values: list[str]) -> list[str]:
     deduplicated_values: list[str] = []
     seen: set[str] = set()
@@ -260,6 +301,34 @@ async def _post_inference(request: Request, endpoint: str, payload: dict[str, An
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Inference service unavailable: {exc}") from exc
     return response.json()
+
+
+async def _semantic_snippets(
+    request: Request,
+    *,
+    query: str,
+    documents: list[dict[str, str | None]],
+) -> dict[str, str]:
+    if not documents:
+        return {}
+
+    payload = await _post_inference(
+        request,
+        "/snippet",
+        {
+            "query": query,
+            "documents": documents,
+            "max_sentences_per_document": 12,
+            "max_snippet_length": 320,
+        },
+    )
+    snippet_map: dict[str, str] = {}
+    for item in payload.get("results", []):
+        document_id = str(item.get("id", ""))
+        if not document_id:
+            continue
+        snippet_map[document_id] = str(item.get("snippet", ""))
+    return snippet_map
 
 
 async def _embed_texts(request: Request, texts: list[str]) -> tuple[str, list[list[float]]]:
@@ -306,6 +375,7 @@ async def index_document(request: Request, payload: IndexRequest) -> IndexRespon
             "url": payload.url,
             "document_id": stored_document_id,
             "source": "indexed",
+            "indexed_at": datetime.now(timezone.utc).isoformat(),
         },
     )
 
@@ -344,6 +414,7 @@ async def index_documents_bulk(request: Request, payload: BulkIndexRequest) -> B
                 "url": document.url,
                 "document_id": document_id,
                 "source": "indexed",
+                "indexed_at": datetime.now(timezone.utc).isoformat(),
             },
         )
         for document_id, document, dense_vector, sparse_vector in zip(
@@ -402,6 +473,7 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
             "title": str(payload_data.get("title", "")),
             "url": str(payload_data.get("url", "")),
             "source": str(payload_data.get("source", "indexed")),
+            "indexed_at": _coerce_indexed_at(payload_data),
             "initial_score": float(hit.score),
         }
 
@@ -433,6 +505,7 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
         {"query": payload.query, "documents": rerank_documents, "top_k": payload.top_k},
     )
     reranked_results = rerank_payload["results"]
+    snippet_map = await _semantic_snippets(request, query=payload.query, documents=rerank_documents)
 
     results = [
         SearchResult(
@@ -441,9 +514,16 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
             score=float(result["score"]),
             source=str(candidates_by_id[result["id"]]["source"]),
             url=str(candidates_by_id[result["id"]]["url"]),
-            snippet=raw_documents.get(result["id"], "")[:240],
+            snippet=snippet_map.get(result["id"], raw_documents.get(result["id"], "")[:240]),
+            indexed_at=candidates_by_id[result["id"]]["indexed_at"],
         )
         for result in reranked_results
         if result["id"] in candidates_by_id
     ]
+    await _store_search_query(
+        request,
+        query=payload.query,
+        top_k=payload.top_k,
+        result_count=len(results),
+    )
     return SearchResponse(query=payload.query, embedding_model=embedding_model, results=results)

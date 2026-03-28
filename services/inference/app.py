@@ -81,6 +81,29 @@ class RerankResponse(BaseModel):
     results: list[RerankResult]
 
 
+class SnippetDocument(BaseModel):
+    id: str
+    text: str
+
+
+class SnippetRequest(BaseModel):
+    query: str
+    documents: list[SnippetDocument] = Field(min_length=1, max_length=32)
+    max_sentences_per_document: int = Field(default=12, ge=1, le=64)
+    max_snippet_length: int = Field(default=320, ge=80, le=1024)
+
+
+class SnippetResult(BaseModel):
+    id: str
+    snippet: str
+    score: float
+
+
+class SnippetResponse(BaseModel):
+    model: str
+    results: list[SnippetResult]
+
+
 class SparseEmbedRequest(BaseModel):
     texts: list[str] = Field(min_length=1, max_length=128)
 
@@ -291,6 +314,75 @@ def _predict_rerank_scores(reranker: CrossEncoder, pairs: list[list[str]]) -> li
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _split_to_sentences(text: str, max_sentences: int) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    raw_segments = SENTENCE_SPLIT_RE.split(stripped)
+    sentences: list[str] = []
+    for segment in raw_segments:
+        normalized = " ".join(segment.split())
+        if not normalized:
+            continue
+        sentences.append(normalized)
+        if len(sentences) >= max_sentences:
+            break
+    return sentences
+
+
+def _truncate_text(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    truncated = value[:max_length].rsplit(" ", 1)[0].strip()
+    if not truncated:
+        return value[:max_length].strip()
+    return truncated
+
+
+def _build_best_snippets(
+    reranker: CrossEncoder,
+    query: str,
+    documents: list[SnippetDocument],
+    max_sentences_per_document: int,
+    max_snippet_length: int,
+) -> list[SnippetResult]:
+    sentence_candidates: list[tuple[str, str]] = []
+    sentence_map: dict[str, list[str]] = {}
+
+    for document in documents:
+        sentences = _split_to_sentences(document.text, max_sentences=max_sentences_per_document)
+        if not sentences:
+            fallback = _truncate_text(" ".join(document.text.split()), max_length=max_snippet_length)
+            sentence_map[document.id] = [fallback] if fallback else []
+            continue
+        sentence_map[document.id] = sentences
+        for sentence in sentences:
+            sentence_candidates.append((document.id, sentence))
+
+    if not sentence_candidates:
+        return [SnippetResult(id=document.id, snippet="", score=0.0) for document in documents]
+
+    pairs = [[query, sentence] for _, sentence in sentence_candidates]
+    sentence_scores = [float(score) for score in reranker.predict(pairs)]
+
+    best_by_document: dict[str, SnippetResult] = {
+        document.id: SnippetResult(id=document.id, snippet="", score=-float("inf"))
+        for document in documents
+    }
+    for (document_id, sentence), score in zip(sentence_candidates, sentence_scores, strict=True):
+        if score <= best_by_document[document_id].score:
+            continue
+        best_by_document[document_id] = SnippetResult(
+            id=document_id,
+            snippet=_truncate_text(sentence, max_length=max_snippet_length),
+            score=score,
+        )
+
+    return [best_by_document[document.id] for document in documents]
 
 
 def _stable_sparse_index(token: str) -> int:
@@ -334,3 +426,21 @@ async def rerank(request: Request, payload: RerankRequest) -> RerankResponse:
     ]
     results = sorted(scored, key=lambda item: item.score, reverse=True)[: payload.top_k]
     return RerankResponse(model=RERANKER_NAME, results=results)
+
+
+@app.post("/snippet", response_model=SnippetResponse)
+async def snippet(request: Request, payload: SnippetRequest) -> SnippetResponse:
+    reranker = _get_reranker(request)
+    rerank_semaphore: asyncio.Semaphore = request.app.state.rerank_semaphore
+
+    async with rerank_semaphore:
+        results = await asyncio.to_thread(
+            _build_best_snippets,
+            reranker,
+            payload.query,
+            payload.documents,
+            payload.max_sentences_per_document,
+            payload.max_snippet_length,
+        )
+
+    return SnippetResponse(model=RERANKER_NAME, results=results)
