@@ -1,14 +1,18 @@
 import { FormEvent, useMemo, useState } from 'react';
 
 const PAGE_SIZE = 10;
+const ASK_DEFAULT_TOP_K = 5;
 const DEFAULT_API_URL = 'http://localhost:8000';
 const API_BASE_URL = (import.meta.env.VITE_API_URL || DEFAULT_API_URL).replace(/\/$/, '');
 const SEARCH_ENDPOINT = `${API_BASE_URL}/search`;
+const ASK_ENDPOINT = `${API_BASE_URL}/ask`;
+
+type Mode = 'search' | 'ask';
 
 interface SearchResult {
   id: string;
   title: string;
-  score: number;
+  score?: number;
   url: string;
   snippet: string;
   source?: string;
@@ -46,9 +50,12 @@ function highlightSnippet(snippet: string, query: string) {
 }
 
 function App() {
+  const [mode, setMode] = useState<Mode>('search');
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [llmAnswer, setLlmAnswer] = useState('');
   const [isSearching, setIsSearching] = useState(false);
+  const [isAsking, setIsAsking] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [visibleLimit, setVisibleLimit] = useState(PAGE_SIZE);
@@ -58,7 +65,7 @@ function App() {
   const [indexedTo, setIndexedTo] = useState('');
 
   const hasResults = results.length > 0;
-  const canLoadMore = results.length >= visibleLimit;
+  const canLoadMore = mode === 'search' && results.length >= visibleLimit;
   const availableSources = useMemo(
     () => ['all', ...Array.from(new Set(results.map((result) => result.source).filter((source): source is string => Boolean(source))))],
     [results],
@@ -99,12 +106,14 @@ function App() {
       return true;
     });
   }, [indexedFrom, indexedTo, results, selectedSource]);
+
+  const isBusy = isSearching || isAsking;
   const containerClassName = useMemo(
     () =>
-      hasResults
+      hasResults || llmAnswer
         ? 'min-h-screen px-4 py-8 sm:px-6 lg:px-8'
         : 'flex min-h-screen items-center justify-center px-4 py-8',
-    [hasResults],
+    [hasResults, llmAnswer],
   );
 
   async function performSearch(searchQuery: string, topK: number) {
@@ -123,6 +132,80 @@ function App() {
     return (await response.json()) as SearchResponse;
   }
 
+  async function performAsk(askQuery: string) {
+    const response = await fetch(ASK_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query: askQuery, top_k: ASK_DEFAULT_TOP_K }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ask request failed with status ${response.status}`);
+    }
+
+    if (!response.body) {
+      throw new Error('Streaming response body is unavailable');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const parseEventBlock = (rawBlock: string): { event: string; data: string } | null => {
+      const lines = rawBlock.split('\n').map((line) => line.trimEnd());
+      let eventName = 'message';
+      const dataLines: string[] = [];
+
+      for (const line of lines) {
+        if (line.startsWith('event:')) {
+          eventName = line.slice('event:'.length).trim();
+        } else if (line.startsWith('data:')) {
+          dataLines.push(line.slice('data:'.length).trimStart());
+        }
+      }
+
+      if (!dataLines.length) {
+        return null;
+      }
+
+      return {
+        event: eventName,
+        data: dataLines.join('\n'),
+      };
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+
+      let separatorIndex = buffer.indexOf('\n\n');
+      while (separatorIndex !== -1) {
+        const block = buffer.slice(0, separatorIndex).trim();
+        buffer = buffer.slice(separatorIndex + 2);
+
+        const parsed = parseEventBlock(block);
+        if (parsed) {
+          if (parsed.event === 'sources') {
+            const parsedSources = JSON.parse(parsed.data) as SearchResult[];
+            setResults(parsedSources);
+          } else if (parsed.event === 'token') {
+            setLlmAnswer((previous) => previous + parsed.data.replace(/\\n/g, '\n'));
+          } else if (parsed.event === 'error') {
+            throw new Error(parsed.data);
+          }
+        }
+
+        separatorIndex = buffer.indexOf('\n\n');
+      }
+
+      if (done) {
+        break;
+      }
+    }
+  }
+
   async function handleSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const trimmedQuery = query.trim();
@@ -130,24 +213,40 @@ function App() {
       return;
     }
 
-    setIsSearching(true);
     setError(null);
     setHasSearched(true);
+    setLastSearchQuery(trimmedQuery);
+    setVisibleLimit(PAGE_SIZE);
+    setSelectedSource('all');
+    setIndexedFrom('');
+    setIndexedTo('');
+    setLlmAnswer('');
 
+    if (mode === 'search') {
+      setIsSearching(true);
+      try {
+        const payload = await performSearch(trimmedQuery, PAGE_SIZE);
+        setResults(payload.results);
+      } catch (requestError) {
+        const message = requestError instanceof Error ? requestError.message : 'Unknown search error';
+        setResults([]);
+        setError(message);
+      } finally {
+        setIsSearching(false);
+      }
+      return;
+    }
+
+    setIsAsking(true);
+    setResults([]);
     try {
-      const payload = await performSearch(trimmedQuery, PAGE_SIZE);
-      setVisibleLimit(PAGE_SIZE);
-      setLastSearchQuery(trimmedQuery);
-      setResults(payload.results);
-      setSelectedSource('all');
-      setIndexedFrom('');
-      setIndexedTo('');
+      await performAsk(trimmedQuery);
     } catch (requestError) {
-      const message = requestError instanceof Error ? requestError.message : 'Unknown search error';
+      const message = requestError instanceof Error ? requestError.message : 'Unknown ask error';
       setResults([]);
       setError(message);
     } finally {
-      setIsSearching(false);
+      setIsAsking(false);
     }
   }
 
@@ -170,10 +269,10 @@ function App() {
 
   return (
     <div className={containerClassName}>
-      <div className={hasResults ? 'mx-auto w-full max-w-4xl' : 'w-full max-w-3xl'}>
-        <div className={hasResults ? 'mb-8' : 'mb-10 text-center'}>
+      <div className={hasResults || llmAnswer ? 'mx-auto w-full max-w-4xl' : 'w-full max-w-3xl'}>
+        <div className={hasResults || llmAnswer ? 'mb-8' : 'mb-10 text-center'}>
           <p className="mb-3 text-sm font-semibold uppercase tracking-[0.4em] text-sky-300/80">Lumina</p>
-          <h1 className={hasResults ? 'text-3xl font-semibold text-white' : 'text-5xl font-semibold text-white'}>
+          <h1 className={hasResults || llmAnswer ? 'text-3xl font-semibold text-white' : 'text-5xl font-semibold text-white'}>
             Distributed Search Engine
           </h1>
           <p className="mt-4 text-sm text-slate-300 sm:text-base">
@@ -182,19 +281,40 @@ function App() {
         </div>
 
         <form onSubmit={handleSearch} className="rounded-3xl border border-white/10 bg-slate-900/70 p-3 shadow-2xl shadow-sky-950/30 backdrop-blur">
+          <div className="mb-3 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setMode('search')}
+              className={`rounded-xl px-4 py-2 text-sm font-medium transition ${
+                mode === 'search' ? 'bg-sky-500 text-slate-950' : 'bg-slate-800 text-slate-200 hover:bg-slate-700'
+              }`}
+            >
+              Search
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('ask')}
+              className={`rounded-xl px-4 py-2 text-sm font-medium transition ${
+                mode === 'ask' ? 'bg-sky-500 text-slate-950' : 'bg-slate-800 text-slate-200 hover:bg-slate-700'
+              }`}
+            >
+              Ask
+            </button>
+          </div>
+
           <div className="flex flex-col gap-3 sm:flex-row">
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search FastAPI, React hooks, queues, documentation..."
+              placeholder={mode === 'ask' ? 'Ask: Что такое очередь?' : 'Search FastAPI, React hooks, queues, documentation...'}
               className="min-h-14 flex-1 rounded-2xl border border-transparent bg-slate-950/80 px-5 text-base text-slate-100 outline-none transition focus:border-sky-400"
             />
             <button
               type="submit"
-              disabled={isSearching}
+              disabled={isBusy}
               className="min-h-14 rounded-2xl bg-sky-500 px-6 font-medium text-slate-950 transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300"
             >
-              {isSearching ? 'Searching…' : 'Search'}
+              {isBusy ? (mode === 'ask' ? 'Answering…' : 'Searching…') : mode === 'ask' ? 'Ask' : 'Search'}
             </button>
           </div>
         </form>
@@ -203,6 +323,13 @@ function App() {
           <div className="mt-6 rounded-2xl border border-rose-500/30 bg-rose-950/40 px-4 py-3 text-sm text-rose-200">
             {error}
           </div>
+        ) : null}
+
+        {mode === 'ask' && llmAnswer ? (
+          <section className="mt-8 rounded-3xl border border-sky-400/20 bg-slate-900/70 p-6">
+            <h2 className="text-lg font-semibold text-sky-200">LLM answer</h2>
+            <p className="mt-4 whitespace-pre-wrap text-sm leading-7 text-slate-100">{llmAnswer}</p>
+          </section>
         ) : null}
 
         {hasResults ? (
@@ -259,7 +386,7 @@ function App() {
                     <p className="mt-1 break-all text-sm text-slate-400">{result.url}</p>
                   </div>
                   <div className="text-sm text-slate-400">
-                    <span>Score: {result.score.toFixed(4)}</span>
+                    {typeof result.score === 'number' ? <span>Score: {result.score.toFixed(4)}</span> : null}
                     {result.source ? <span className="ml-3">Source: {result.source}</span> : null}
                     {result.indexed_at ? (
                       <span className="ml-3">Indexed: {new Date(result.indexed_at).toLocaleDateString()}</span>
@@ -291,7 +418,7 @@ function App() {
               </div>
             ) : null}
           </div>
-        ) : hasSearched && !isSearching ? (
+        ) : hasSearched && !isBusy ? (
           <div className="mt-8 rounded-3xl border border-white/10 bg-slate-900/50 p-6 text-center text-slate-300">
             No results found. Try indexing documents with the crawler and search again.
           </div>
