@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import json
+import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from uuid import uuid4
 import asyncpg
 import httpx
 import structlog
+import redis.asyncio as redis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +43,8 @@ LLM_BASE_URL = os.getenv("LUMINA_LLM_BASE_URL")
 LLM_MODEL = os.getenv("LUMINA_LLM_MODEL", "gpt-4o-mini")
 LLM_MAX_TOKENS = int(os.getenv("LUMINA_LLM_MAX_TOKENS", "512"))
 ASK_TOP_K = int(os.getenv("LUMINA_ASK_TOP_K", "5"))
+REDIS_URL = os.getenv("LUMINA_REDIS_URL", "redis://redis:6379/0")
+SEARCH_CACHE_TTL_SECONDS = int(os.getenv("LUMINA_SEARCH_CACHE_TTL_SECONDS", "600"))
 
 def _configure_logging() -> None:
     logging.basicConfig(format="%(message)s", level=os.getenv("LUMINA_LOG_LEVEL", "INFO"), force=True)
@@ -91,6 +95,7 @@ class BulkIndexResponse(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     top_k: int = Field(default=10, ge=1, le=50)
+    filters: dict[str, Any] | None = None
 
 
 class SearchResult(BaseModel):
@@ -146,10 +151,12 @@ async def lifespan(app: FastAPI):
     http_client = httpx.AsyncClient(timeout=30.0)
     qdrant = AsyncQdrantClient(url=QDRANT_URL)
     pg_pool = await asyncpg.create_pool(dsn=POSTGRES_DSN, min_size=1, max_size=10)
+    redis_client = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
 
     app.state.http_client = http_client
     app.state.qdrant = qdrant
     app.state.pg_pool = pg_pool
+    app.state.redis_client = redis_client
 
     async with pg_pool.acquire() as conn:
         await conn.execute(
@@ -201,6 +208,7 @@ async def lifespan(app: FastAPI):
     await http_client.aclose()
     await qdrant.close()
     await pg_pool.close()
+    await redis_client.aclose()
 
 
 app = FastAPI(title="lumina-gateway", version="0.4.0", lifespan=lifespan)
@@ -232,6 +240,24 @@ def _get_pg_pool(request: Request) -> asyncpg.Pool:
     if pool is None:
         raise HTTPException(status_code=503, detail="PostgreSQL pool is not initialized")
     return pool
+
+
+def _get_redis_client(request: Request) -> redis.Redis:
+    client = getattr(request.app.state, "redis_client", None)
+    if client is None:
+        raise HTTPException(status_code=503, detail="Redis client is not initialized")
+    return client
+
+
+def _build_search_cache_key(payload: SearchRequest) -> str:
+    cache_payload = {
+        "query": payload.query,
+        "top_k": payload.top_k,
+        "filters": payload.filters or {},
+    }
+    serialized_payload = json.dumps(cache_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    key_hash = hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest()
+    return f"search:{key_hash}"
 
 
 async def _store_raw_document(request: Request, document_id: str, content: str) -> str:
@@ -577,6 +603,13 @@ async def index_documents_bulk(request: Request, payload: BulkIndexRequest) -> B
 
 @app.post("/search", response_model=SearchResponse)
 async def search(request: Request, payload: SearchRequest) -> SearchResponse:
+    redis_client = _get_redis_client(request)
+    cache_key = _build_search_cache_key(payload)
+    cached_response = await redis_client.get(cache_key)
+    if cached_response is not None:
+        cached_data = json.loads(cached_response)
+        return SearchResponse.model_validate(cached_data)
+
     embedding_model, embeddings = await _embed_texts(request, [payload.query])
     _, sparse_embeddings = await _sparse_embed_texts(request, [payload.query])
     qdrant = _get_qdrant(request)
@@ -663,7 +696,13 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
         top_k=payload.top_k,
         result_count=len(results),
     )
-    return SearchResponse(query=payload.query, embedding_model=embedding_model, results=results)
+    response = SearchResponse(query=payload.query, embedding_model=embedding_model, results=results)
+    await redis_client.set(
+        cache_key,
+        json.dumps(response.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")),
+        ex=SEARCH_CACHE_TTL_SECONDS,
+    )
+    return response
 
 
 @app.post("/ask")
