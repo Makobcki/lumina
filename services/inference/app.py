@@ -351,15 +351,14 @@ def _build_best_snippets(
     max_snippet_length: int,
 ) -> list[SnippetResult]:
     sentence_candidates: list[tuple[str, str]] = []
-    sentence_map: dict[str, list[str]] = {}
 
     for document in documents:
         sentences = _split_to_sentences(document.text, max_sentences=max_sentences_per_document)
         if not sentences:
             fallback = _truncate_text(" ".join(document.text.split()), max_length=max_snippet_length)
-            sentence_map[document.id] = [fallback] if fallback else []
+            if fallback:
+                sentence_candidates.append((document.id, fallback))
             continue
-        sentence_map[document.id] = sentences
         for sentence in sentences:
             sentence_candidates.append((document.id, sentence))
 
@@ -369,12 +368,10 @@ def _build_best_snippets(
     pairs = [[query, sentence] for _, sentence in sentence_candidates]
     sentence_scores = [float(score) for score in reranker.predict(pairs)]
 
-    best_by_document: dict[str, SnippetResult] = {
-        document.id: SnippetResult(id=document.id, snippet="", score=-float("inf"))
-        for document in documents
-    }
+    best_by_document: dict[str, SnippetResult] = {}
     for (document_id, sentence), score in zip(sentence_candidates, sentence_scores, strict=True):
-        if score <= best_by_document[document_id].score:
+        current_best = best_by_document.get(document_id)
+        if current_best is not None and score <= current_best.score:
             continue
         best_by_document[document_id] = SnippetResult(
             id=document_id,
@@ -382,7 +379,7 @@ def _build_best_snippets(
             score=score,
         )
 
-    return [best_by_document[document.id] for document in documents]
+    return [best_by_document.get(document.id, SnippetResult(id=document.id, snippet="", score=0.0)) for document in documents]
 
 
 def _stable_sparse_index(token: str) -> int:
