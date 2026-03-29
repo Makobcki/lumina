@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -136,9 +137,8 @@ def _extract_title_and_text(html: str, fallback_title: str) -> tuple[str, str]:
             tag.decompose()
 
     title = soup.title.string.strip() if soup.title and soup.title.string else fallback_title
-    lines = [line.strip() for line in soup.get_text(separator="\n").splitlines()]
-    cleaned_lines = [line for line in lines if line]
-    cleaned_text = "\n".join(cleaned_lines)
+    raw_text = soup.get_text(separator=" ", strip=True)
+    cleaned_text = re.sub(r"\s+", " ", raw_text).strip()
     return title, cleaned_text
 
 
@@ -166,13 +166,26 @@ async def fetch_and_clean(
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> list[str]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if chunk_overlap < 0:
+        raise ValueError("chunk_overlap must be >= 0")
+    if chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be less than chunk_size")
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=["\n\n", "\n", ". ", " ", ""],
         keep_separator=False,
     )
-    return [chunk for chunk in splitter.split_text(text) if chunk]
+    chunks: list[str] = []
+    for chunk in splitter.split_text(text):
+        normalized_chunk = re.sub(r"\s+", " ", chunk).strip()
+        if not normalized_chunk or len(normalized_chunk) <= 1:
+            continue
+        chunks.append(normalized_chunk)
+    return chunks
 
 
 def _build_documents(url: str, title: str, batch_start_index: int, batch_chunks: list[str]) -> list[dict[str, str]]:

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import structlog
+import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -26,6 +27,17 @@ EMBED_CONCURRENCY_LIMIT = int(os.getenv("LUMINA_EMBED_CONCURRENCY", "1"))
 RERANK_CONCURRENCY_LIMIT = int(os.getenv("LUMINA_RERANK_CONCURRENCY", "1"))
 SPARSE_VOCAB_SIZE = int(os.getenv("LUMINA_SPARSE_VOCAB_SIZE", "200000"))
 SPARSE_MIN_TOKEN_LEN = int(os.getenv("LUMINA_SPARSE_MIN_TOKEN_LEN", "2"))
+
+
+def _resolve_model_device(configured_device: str) -> str:
+    normalized_device = configured_device.strip().lower()
+    if normalized_device.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning(
+            "cuda_requested_but_unavailable_fallback_to_cpu",
+            configured_device=configured_device,
+        )
+        return "cpu"
+    return configured_device
 
 def _configure_logging() -> None:
     logging.basicConfig(format="%(message)s", level=os.getenv("LUMINA_LOG_LEVEL", "INFO"), force=True)
@@ -215,17 +227,19 @@ async def _embed_worker(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("loading_embedding_model", model=MODEL_NAME, device=MODEL_DEVICE)
-    model = SentenceTransformer(MODEL_NAME, device=MODEL_DEVICE)
+    runtime_device = _resolve_model_device(MODEL_DEVICE)
+    logger.info("loading_embedding_model", model=MODEL_NAME, device=runtime_device)
+    model = SentenceTransformer(MODEL_NAME, device=runtime_device)
     embedding_dimension = model.get_sentence_embedding_dimension()
     if embedding_dimension is None:
         raise RuntimeError(f"Unable to determine embedding dimension for model '{MODEL_NAME}'")
 
-    logger.info("loading_reranker_model", model=RERANKER_NAME, device=MODEL_DEVICE)
-    reranker = CrossEncoder(RERANKER_NAME, device=MODEL_DEVICE)
+    logger.info("loading_reranker_model", model=RERANKER_NAME, device=runtime_device)
+    reranker = CrossEncoder(RERANKER_NAME, device=runtime_device)
 
     app.state.model = model
     app.state.reranker = reranker
+    app.state.device = runtime_device
     app.state.vector_size = int(embedding_dimension)
     app.state.embed_queue = asyncio.Queue()
     app.state.embed_semaphore = asyncio.Semaphore(EMBED_CONCURRENCY_LIMIT)
@@ -273,7 +287,7 @@ def health(request: Request) -> HealthResponse:
         model=MODEL_NAME,
         reranker=RERANKER_NAME,
         vector_size=vector_size,
-        device=MODEL_DEVICE,
+        device=str(getattr(request.app.state, "device", MODEL_DEVICE)),
         embed_queue_size=embed_queue.qsize(),
         embed_batch_size=EMBED_MAX_BATCH_SIZE,
         embed_batch_timeout_ms=EMBED_BATCH_TIMEOUT_MS,
