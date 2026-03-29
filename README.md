@@ -34,6 +34,7 @@ Then check:
 - Qdrant: `http://localhost:6333/dashboard`
 - Indexing: `POST http://localhost:8000/index`
 - Search: `POST http://localhost:8000/search`
+- Ask (RAG): `POST http://localhost:8000/ask`
 
 ## Crawler
 Install crawler dependencies and run locally:
@@ -103,6 +104,31 @@ VITE_API_URL=http://203.0.113.10:8000 npm run build
 
 If `VITE_API_URL` is not set, the app falls back to `http://localhost:8000`.
 Search results support incremental loading via a **Load more** button (10 results per page).
+Frontend now supports **Search / Ask** mode switch. In **Ask**, the gateway streams an LLM answer and shows source snippets used for context.
+
+## LLM settings for `/ask`
+Configure gateway RAG generation in `.env`:
+
+```bash
+LUMINA_LLM_MODEL=gpt-4o-mini
+LUMINA_LLM_API_KEY=...
+LUMINA_LLM_BASE_URL=... # optional (for Ollama/OpenAI-compatible endpoints)
+LUMINA_LLM_MAX_TOKENS=512
+LUMINA_ASK_TOP_K=5
+```
+
+Examples:
+
+```bash
+# OpenAI-compatible
+LUMINA_LLM_MODEL=gpt-4o-mini
+LUMINA_LLM_API_KEY=sk-...
+
+# Ollama (OpenAI-compatible endpoint)
+LUMINA_LLM_MODEL=ollama/llama3.1
+LUMINA_LLM_BASE_URL=http://localhost:11434
+LUMINA_LLM_API_KEY=dummy
+```
 
 ## Current status
 This repository now contains the **distributed architecture scaffold**, but not yet:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -13,6 +15,8 @@ import structlog
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from litellm import acompletion
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models
@@ -32,6 +36,11 @@ RERANK_CANDIDATE_MULTIPLIER = int(os.getenv("LUMINA_RERANK_CANDIDATE_MULTIPLIER"
 MAX_RERANK_CANDIDATES = int(os.getenv("LUMINA_MAX_RERANK_CANDIDATES", "30"))
 DENSE_VECTOR_NAME = os.getenv("LUMINA_QDRANT_DENSE_VECTOR_NAME", "dense")
 SPARSE_VECTOR_NAME = os.getenv("LUMINA_QDRANT_SPARSE_VECTOR_NAME", "sparse")
+LLM_API_KEY = os.getenv("LUMINA_LLM_API_KEY")
+LLM_BASE_URL = os.getenv("LUMINA_LLM_BASE_URL")
+LLM_MODEL = os.getenv("LUMINA_LLM_MODEL", "gpt-4o-mini")
+LLM_MAX_TOKENS = int(os.getenv("LUMINA_LLM_MAX_TOKENS", "512"))
+ASK_TOP_K = int(os.getenv("LUMINA_ASK_TOP_K", "5"))
 
 def _configure_logging() -> None:
     logging.basicConfig(format="%(message)s", level=os.getenv("LUMINA_LOG_LEVEL", "INFO"), force=True)
@@ -98,6 +107,21 @@ class SearchResponse(BaseModel):
     query: str
     embedding_model: str
     results: list[SearchResult]
+
+
+class AskRequest(BaseModel):
+    query: str = Field(min_length=1)
+    top_k: int = Field(default=ASK_TOP_K, ge=1, le=10)
+
+
+class AskSource(BaseModel):
+    id: str
+    title: str
+    url: str
+    source: str
+    score: float
+    indexed_at: str | None = None
+    snippet: str
 
 
 class HealthResponse(BaseModel):
@@ -354,6 +378,25 @@ async def _semantic_snippets(
             continue
         snippet_map[document_id] = str(item.get("snippet", ""))
     return snippet_map
+
+
+def _build_ask_system_prompt(results: list[SearchResult]) -> str:
+    snippets = "\n\n".join(
+        [
+            (
+                f"[{index}] Заголовок: {result.title}\n"
+                f"URL: {result.url}\n"
+                f"Источник: {result.source}\n"
+                f"Сниппет: {result.snippet}"
+            )
+            for index, result in enumerate(results, start=1)
+        ]
+    )
+    return (
+        "Ты полезный ассистент. Ответь на вопрос пользователя, используя ТОЛЬКО предоставленный контекст. "
+        "Если контекста недостаточно, честно скажи, что в источниках нет точного ответа.\n\n"
+        f"Контекст:\n{snippets}"
+    )
 
 
 async def _embed_texts(request: Request, texts: list[str]) -> tuple[str, list[list[float]]]:
@@ -621,6 +664,67 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
         result_count=len(results),
     )
     return SearchResponse(query=payload.query, embedding_model=embedding_model, results=results)
+
+
+@app.post("/ask")
+async def ask(request: Request, payload: AskRequest) -> StreamingResponse:
+    search_payload = SearchRequest(query=payload.query, top_k=payload.top_k)
+    search_response = await search(request, search_payload)
+    context_results = search_response.results
+    sources = [
+        AskSource(
+            id=result.id,
+            title=result.title,
+            url=result.url,
+            source=result.source,
+            score=result.score,
+            indexed_at=result.indexed_at,
+            snippet=result.snippet,
+        )
+        for result in context_results
+    ]
+
+    async def event_stream() -> AsyncIterator[str]:
+        source_json = [source.model_dump() for source in sources]
+        yield f"event: sources\ndata: {json.dumps(source_json, ensure_ascii=False)}\n\n"
+
+        if not context_results:
+            yield "event: done\ndata: Контекст не найден. Попробуйте переформулировать запрос.\n\n"
+            return
+
+        messages = [
+            {"role": "system", "content": _build_ask_system_prompt(context_results)},
+            {"role": "user", "content": payload.query},
+        ]
+        try:
+            completion = await acompletion(
+                model=LLM_MODEL,
+                messages=messages,
+                stream=True,
+                api_key=LLM_API_KEY,
+                api_base=LLM_BASE_URL,
+                max_tokens=LLM_MAX_TOKENS,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            error_message = str(exc).replace("\n", " ")
+            yield f"event: error\ndata: {error_message}\n\n"
+            return
+
+        async for chunk in completion:
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            content = delta.get("content")
+            if not content:
+                continue
+            escaped_content = str(content).replace("\n", "\\n")
+            yield f"event: token\ndata: {escaped_content}\n\n"
+
+        yield "event: done\ndata: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.delete("/documents", response_model=DeleteDocumentsResponse)
