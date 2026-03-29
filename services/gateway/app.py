@@ -4,6 +4,7 @@ import logging
 import os
 import json
 import hashlib
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -257,7 +258,24 @@ def _build_search_cache_key(payload: SearchRequest) -> str:
     }
     serialized_payload = json.dumps(cache_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     key_hash = hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest()
-    return f"search:{key_hash}"
+    return f"lumina:cache:search:{key_hash}"
+
+
+async def _cache_search_response(
+    redis_client: redis.Redis,
+    *,
+    cache_key: str,
+    response: SearchResponse,
+) -> None:
+    try:
+        await redis_client.set(
+            cache_key,
+            json.dumps(response.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")),
+            ex=SEARCH_CACHE_TTL_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning("search_cache_store_failed", cache_key=cache_key, error=str(exc))
+
 
 
 async def _store_raw_document(request: Request, document_id: str, content: str) -> str:
@@ -697,11 +715,7 @@ async def search(request: Request, payload: SearchRequest) -> SearchResponse:
         result_count=len(results),
     )
     response = SearchResponse(query=payload.query, embedding_model=embedding_model, results=results)
-    await redis_client.set(
-        cache_key,
-        json.dumps(response.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")),
-        ex=SEARCH_CACHE_TTL_SECONDS,
-    )
+    asyncio.create_task(_cache_search_response(redis_client, cache_key=cache_key, response=response))
     return response
 
 
