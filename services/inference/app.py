@@ -12,6 +12,8 @@ import structlog
 import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from prometheus_client import Gauge
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
@@ -27,6 +29,10 @@ EMBED_CONCURRENCY_LIMIT = int(os.getenv("LUMINA_EMBED_CONCURRENCY", "1"))
 RERANK_CONCURRENCY_LIMIT = int(os.getenv("LUMINA_RERANK_CONCURRENCY", "1"))
 SPARSE_VOCAB_SIZE = int(os.getenv("LUMINA_SPARSE_VOCAB_SIZE", "200000"))
 SPARSE_MIN_TOKEN_LEN = int(os.getenv("LUMINA_SPARSE_MIN_TOKEN_LEN", "2"))
+EMBED_QUEUE_SIZE_GAUGE = Gauge(
+    "lumina_embed_queue_size",
+    "Number of embed requests waiting for GPU processing",
+)
 
 
 def _resolve_model_device(configured_device: str) -> str:
@@ -206,6 +212,7 @@ async def _embed_worker(app: FastAPI) -> None:
     while True:
         jobs: list[EmbedJob] = []
         first_job = await queue.get()
+        EMBED_QUEUE_SIZE_GAUGE.dec()
         jobs.append(first_job)
 
         deadline = asyncio.get_running_loop().time() + batch_timeout
@@ -217,6 +224,7 @@ async def _embed_worker(app: FastAPI) -> None:
                 next_job = await asyncio.wait_for(queue.get(), timeout=timeout)
             except asyncio.TimeoutError:
                 break
+            EMBED_QUEUE_SIZE_GAUGE.dec()
             jobs.append(next_job)
 
         try:
@@ -263,6 +271,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="lumina-inference", version="0.3.0", lifespan=lifespan)
+Instrumentator().instrument(app).expose(app, include_in_schema=False, route_name="/metrics")
 
 
 def _get_model(request: Request) -> SentenceTransformer:
@@ -303,6 +312,7 @@ async def embed(request: Request, payload: EmbedRequest) -> EmbedResponse:
     _get_model(request)
     queue: asyncio.Queue[EmbedJob] = request.app.state.embed_queue
     future: asyncio.Future[list[list[float]]] = asyncio.get_running_loop().create_future()
+    EMBED_QUEUE_SIZE_GAUGE.inc()
     await queue.put(EmbedJob(texts=payload.texts, normalize=payload.normalize, future=future))
     embeddings = await future
 

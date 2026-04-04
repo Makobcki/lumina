@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from litellm import acompletion
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models
@@ -213,6 +214,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="lumina-gateway", version="0.4.0", lifespan=lifespan)
+Instrumentator().instrument(app).expose(app, include_in_schema=False, route_name="/metrics")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

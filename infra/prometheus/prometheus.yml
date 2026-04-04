@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'lumina-gateway'
+    static_configs:
+      - targets: ['gateway:8000']
+
+  - job_name: 'lumina-inference'
+    static_configs:
+      - targets: ['inference:8001']
+
+  - job_name: 'lumina-qdrant'
+    static_configs:
+      - targets: ['qdrant:6333']
