@@ -16,6 +16,7 @@ RUN apt-get update \
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir uv==0.8.13 \
+    && uv pip install --system --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128 \
     && uv pip install --system -r requirements.txt
 
 RUN python -c "import os; from sentence_transformers import CrossEncoder, SentenceTransformer; SentenceTransformer(os.environ['LUMINA_EMBED_MODEL'], device='cpu'); CrossEncoder(os.environ['LUMINA_RERANKER_MODEL'], device='cpu')"

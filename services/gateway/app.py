@@ -391,8 +391,13 @@ async def _post_inference(request: Request, endpoint: str, payload: dict[str, An
     try:
         response = await client.post(f"{INFERENCE_URL}{endpoint}", json=payload)
         response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        # Пробрасываем реальную ошибку (например 422 или 500) от микросервиса
+        error_body = exc.response.text
+        raise HTTPException(status_code=502, detail=f"Inference error {exc.response.status_code}: {error_body}") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Inference service unavailable: {exc}") from exc
+        # Сработает, если контейнер inference упал (Connection refused)
+        raise HTTPException(status_code=502, detail=f"Inference unreachable: {exc}") from exc
     return response.json()
 
 
