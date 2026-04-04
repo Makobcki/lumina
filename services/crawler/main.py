@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Iterable
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
@@ -34,6 +34,9 @@ DEFAULT_CRAWL_DELAY_SECONDS = 0.5
 INGESTION_MODE = os.getenv("LUMINA_INGESTION_MODE", "direct")
 REDIS_URL = os.getenv("LUMINA_REDIS_URL", "redis://localhost:6379/0")
 REDIS_STREAM_NAME = os.getenv("LUMINA_REDIS_STREAM_NAME", "lumina:index:bulk")
+REDIS_FRONTIER_QUEUE_KEY = os.getenv("LUMINA_REDIS_FRONTIER_QUEUE_KEY", "lumina:crawler:frontier:queue")
+REDIS_FRONTIER_SEEN_KEY = os.getenv("LUMINA_REDIS_FRONTIER_SEEN_KEY", "lumina:crawler:frontier:seen")
+MAX_CRAWL_PAGES = int(os.getenv("LUMINA_MAX_CRAWL_PAGES", "500"))
 START_URLS = [
     "https://fastapi.tiangolo.com/",
     "https://ru.wikipedia.org/wiki/Очередь_(программирование)",
@@ -142,11 +145,34 @@ def _extract_title_and_text(html: str, fallback_title: str) -> tuple[str, str]:
     return title, cleaned_text
 
 
+def _normalize_url(raw_url: str, base_url: str) -> str | None:
+    absolute_url = urljoin(base_url, raw_url)
+    normalized_url, _ = urldefrag(absolute_url)
+    parsed = urlparse(normalized_url)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    return normalized_url
+
+
+def _extract_links(html: str, page_url: str, allowed_domains: set[str]) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+    for anchor in soup.find_all("a", href=True):
+        normalized_url = _normalize_url(anchor["href"], base_url=page_url)
+        if normalized_url is None:
+            continue
+        if urlparse(normalized_url).netloc not in allowed_domains:
+            continue
+        links.append(normalized_url)
+    return links
+
+
 async def fetch_and_clean(
     url: str,
     client: httpx.AsyncClient,
     politeness_policy: PolitenessPolicy,
-) -> tuple[str, str] | None:
+    allowed_domains: set[str],
+) -> tuple[str, str, list[str]] | None:
     if not await politeness_policy.can_fetch(url=url, client=client):
         logger.warning("robots_txt_disallows_crawling", url=url)
         return None
@@ -162,7 +188,9 @@ async def fetch_and_clean(
             response = await client.get(url, follow_redirects=True)
             response.raise_for_status()
 
-    return await asyncio.to_thread(_extract_title_and_text, response.text, url)
+    title, text = await asyncio.to_thread(_extract_title_and_text, response.text, url)
+    links = await asyncio.to_thread(_extract_links, response.text, url, allowed_domains)
+    return title, text, links
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> list[str]:
@@ -326,13 +354,19 @@ async def crawl_and_index(
     politeness_policy: PolitenessPolicy,
     indexing_semaphore: asyncio.Semaphore,
     stream_client: redis.Redis | None,
-) -> None:
+    allowed_domains: set[str],
+) -> list[str]:
     logger.info("fetching_url", url=url)
-    result = await fetch_and_clean(url=url, client=fetch_client, politeness_policy=politeness_policy)
+    result = await fetch_and_clean(
+        url=url,
+        client=fetch_client,
+        politeness_policy=politeness_policy,
+        allowed_domains=allowed_domains,
+    )
     if result is None:
-        return
+        return []
 
-    title, text = result
+    title, text, links = result
     chunks = chunk_text(text)
     logger.info("chunks_prepared", chunk_count=len(chunks), url=url)
     await _delete_existing_document(url=url, client=gateway_client, semaphore=indexing_semaphore)
@@ -344,6 +378,28 @@ async def crawl_and_index(
         semaphore=indexing_semaphore,
         stream_client=stream_client,
     )
+    return links
+
+
+class RedisFrontier:
+    def __init__(self, redis_client: redis.Redis, queue_key: str, seen_key: str) -> None:
+        self.redis_client = redis_client
+        self.queue_key = queue_key
+        self.seen_key = seen_key
+
+    async def seed(self, urls: Iterable[str]) -> None:
+        for url in urls:
+            await self.push(url)
+
+    async def push(self, url: str) -> bool:
+        added = await self.redis_client.sadd(self.seen_key, url)
+        if added:
+            await self.redis_client.rpush(self.queue_key, url)
+            return True
+        return False
+
+    async def pop(self) -> str | None:
+        return await self.redis_client.lpop(self.queue_key)
 
 
 async def run_crawler(urls: list[str]) -> None:
@@ -356,36 +412,49 @@ async def run_crawler(urls: list[str]) -> None:
     politeness_policy = PolitenessPolicy(delay_seconds=DEFAULT_CRAWL_DELAY_SECONDS)
     indexing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INDEX_REQUESTS)
 
-    redis_client: redis.Redis | None = None
+    redis_client = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+    await redis_client.ping()
+    frontier = RedisFrontier(
+        redis_client=redis_client,
+        queue_key=REDIS_FRONTIER_QUEUE_KEY,
+        seen_key=REDIS_FRONTIER_SEEN_KEY,
+    )
+    await frontier.seed(urls)
+
     if INGESTION_MODE == "redis_stream":
-        redis_client = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-        await redis_client.ping()
         logger.info("redis_stream_mode_enabled", redis_url=REDIS_URL, stream=REDIS_STREAM_NAME)
+
+    allowed_domains = {urlparse(url).netloc for url in urls}
 
     async with httpx.AsyncClient(timeout=timeout, limits=limits, headers={"User-Agent": USER_AGENT}) as fetch_client, httpx.AsyncClient(
         timeout=timeout,
         limits=limits,
         headers={"User-Agent": USER_AGENT},
     ) as gateway_client:
-        tasks = [
-            crawl_and_index(
-                url=url,
-                fetch_client=fetch_client,
-                gateway_client=gateway_client,
-                politeness_policy=politeness_policy,
-                indexing_semaphore=indexing_semaphore,
-                stream_client=redis_client,
-            )
-            for url in urls
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        crawled_pages = 0
+        while crawled_pages < MAX_CRAWL_PAGES:
+            url = await frontier.pop()
+            if url is None:
+                logger.info("frontier_exhausted", crawled_pages=crawled_pages)
+                break
 
-    if redis_client is not None:
-        await redis_client.aclose()
+            try:
+                discovered_links = await crawl_and_index(
+                    url=url,
+                    fetch_client=fetch_client,
+                    gateway_client=gateway_client,
+                    politeness_policy=politeness_policy,
+                    indexing_semaphore=indexing_semaphore,
+                    stream_client=redis_client if INGESTION_MODE == "redis_stream" else None,
+                    allowed_domains=allowed_domains,
+                )
+                for discovered_url in discovered_links:
+                    await frontier.push(discovered_url)
+                crawled_pages += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.error("crawl_failed", url=url, error=str(exc))
 
-    for url, result in zip(urls, results, strict=True):
-        if isinstance(result, Exception):
-            logger.error("crawl_failed", url=url, error=str(result))
+    await redis_client.aclose()
 
 
 if __name__ == "__main__":
