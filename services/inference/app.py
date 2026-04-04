@@ -155,6 +155,7 @@ class EmbedJob:
 def _encode_texts(model: SentenceTransformer, texts: list[str], normalize: bool) -> list[list[float]]:
     embeddings = model.encode(
         texts,
+        batch_size=8,
         normalize_embeddings=normalize,
         convert_to_numpy=True,
         show_progress_bar=False,
@@ -327,7 +328,7 @@ def _predict_rerank_scores(reranker: CrossEncoder, pairs: list[list[str]]) -> li
     return [float(score) for score in reranker.predict(pairs)]
 
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
+TOKEN_RE = re.compile(r"[\w_./:-]+", re.UNICODE)
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
