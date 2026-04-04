@@ -37,6 +37,8 @@ REDIS_STREAM_NAME = os.getenv("LUMINA_REDIS_STREAM_NAME", "lumina:index:bulk")
 REDIS_FRONTIER_QUEUE_KEY = os.getenv("LUMINA_REDIS_FRONTIER_QUEUE_KEY", "lumina:crawler:frontier:queue")
 REDIS_FRONTIER_SEEN_KEY = os.getenv("LUMINA_REDIS_FRONTIER_SEEN_KEY", "lumina:crawler:frontier:seen")
 MAX_CRAWL_PAGES = int(os.getenv("LUMINA_MAX_CRAWL_PAGES", "500"))
+MAX_CONCURRENT_CRAWLERS = int(os.getenv("LUMINA_MAX_CONCURRENT_CRAWLERS", "8"))
+RESET_FRONTIER_ON_START = os.getenv("LUMINA_RESET_FRONTIER_ON_START", "true").lower() in {"1", "true", "yes"}
 START_URLS = [
     "https://fastapi.tiangolo.com/",
     "https://ru.wikipedia.org/wiki/Очередь_(программирование)",
@@ -391,6 +393,9 @@ class RedisFrontier:
         for url in urls:
             await self.push(url)
 
+    async def reset(self) -> None:
+        await self.redis_client.delete(self.queue_key, self.seen_key)
+
     async def push(self, url: str) -> bool:
         added = await self.redis_client.sadd(self.seen_key, url)
         if added:
@@ -400,6 +405,60 @@ class RedisFrontier:
 
     async def pop(self) -> str | None:
         return await self.redis_client.lpop(self.queue_key)
+
+
+@dataclass(slots=True)
+class CrawlState:
+    processed_pages: int = 0
+    in_flight: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+async def _crawl_worker(
+    worker_id: int,
+    frontier: RedisFrontier,
+    fetch_client: httpx.AsyncClient,
+    gateway_client: httpx.AsyncClient,
+    politeness_policy: PolitenessPolicy,
+    indexing_semaphore: asyncio.Semaphore,
+    stream_client: redis.Redis | None,
+    allowed_domains: set[str],
+    state: CrawlState,
+) -> None:
+    while True:
+        url = await frontier.pop()
+        if url is None:
+            async with state.lock:
+                should_stop = state.in_flight == 0
+            if should_stop:
+                logger.info("worker_stopped_frontier_exhausted", worker_id=worker_id)
+                return
+            await asyncio.sleep(0.2)
+            continue
+
+        async with state.lock:
+            if state.processed_pages >= MAX_CRAWL_PAGES:
+                return
+            state.processed_pages += 1
+            state.in_flight += 1
+
+        try:
+            discovered_links = await crawl_and_index(
+                url=url,
+                fetch_client=fetch_client,
+                gateway_client=gateway_client,
+                politeness_policy=politeness_policy,
+                indexing_semaphore=indexing_semaphore,
+                stream_client=stream_client,
+                allowed_domains=allowed_domains,
+            )
+            for discovered_url in discovered_links:
+                await frontier.push(discovered_url)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("crawl_failed", worker_id=worker_id, url=url, error=str(exc))
+        finally:
+            async with state.lock:
+                state.in_flight -= 1
 
 
 async def run_crawler(urls: list[str]) -> None:
@@ -419,6 +478,8 @@ async def run_crawler(urls: list[str]) -> None:
         queue_key=REDIS_FRONTIER_QUEUE_KEY,
         seen_key=REDIS_FRONTIER_SEEN_KEY,
     )
+    if RESET_FRONTIER_ON_START:
+        await frontier.reset()
     await frontier.seed(urls)
 
     if INGESTION_MODE == "redis_stream":
@@ -431,28 +492,26 @@ async def run_crawler(urls: list[str]) -> None:
         limits=limits,
         headers={"User-Agent": USER_AGENT},
     ) as gateway_client:
-        crawled_pages = 0
-        while crawled_pages < MAX_CRAWL_PAGES:
-            url = await frontier.pop()
-            if url is None:
-                logger.info("frontier_exhausted", crawled_pages=crawled_pages)
-                break
-
-            try:
-                discovered_links = await crawl_and_index(
-                    url=url,
+        state = CrawlState()
+        worker_count = max(1, min(MAX_CONCURRENT_CRAWLERS, MAX_CRAWL_PAGES))
+        workers = [
+            asyncio.create_task(
+                _crawl_worker(
+                    worker_id=worker_id,
+                    frontier=frontier,
                     fetch_client=fetch_client,
                     gateway_client=gateway_client,
                     politeness_policy=politeness_policy,
                     indexing_semaphore=indexing_semaphore,
                     stream_client=redis_client if INGESTION_MODE == "redis_stream" else None,
                     allowed_domains=allowed_domains,
+                    state=state,
                 )
-                for discovered_url in discovered_links:
-                    await frontier.push(discovered_url)
-                crawled_pages += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.error("crawl_failed", url=url, error=str(exc))
+            )
+            for worker_id in range(worker_count)
+        ]
+        await asyncio.gather(*workers)
+        logger.info("crawl_completed", processed_pages=state.processed_pages, workers=worker_count)
 
     await redis_client.aclose()
 
